@@ -99,6 +99,9 @@ the design keeps residual error small and bounded:
   always detected.
 - **Requests in flight during a crash**: lost (at most ~5 s of traffic).
   Inherent to any scrape-based design.
+- **Client-cancelled streams** (e.g. Kilo aborts a request): the terminal
+  usage event never arrives, so those tokens stay uncounted. The
+  `ollama_inflight_requests` gauge still drops to 0.
 
 The 5 s scrape interval on the `ollama` job keeps all these windows small.
 There is no billing-grade exactness here; daily/weekly/monthly answers from
@@ -131,6 +134,52 @@ The upstream OpenAI usage changes are still unmerged, so the endpoint parser
 and streaming handling are maintained as a narrow local patch. `bin/up` builds
 this image through Compose; no manually built image is required.
 
+### Streaming usage timing and live state
+
+For OpenAI-compatible streaming requests, Ollama reports exact usage in the
+terminal usage event. Token totals therefore update at request completion
+rather than token-by-token. The dashboard exposes an in-flight inference
+indicator so active work is visible immediately: the proxy exports
+`ollama_inflight_requests` (gauge, labeled by endpoint for `/v1/chat/completions`,
+`/api/chat`, `/api/generate`) for the full lifetime of each metered request,
+including errors and client disconnects, and the "Inference state" panel shows
+`ACTIVE` / `IDLE` with a 5 s dashboard refresh. Token panels are named
+"Completed …" because they only reflect requests that have finished.
+
+### `generated_tokens=2` investigation (2026-09-03)
+
+A real Kilo request reported `prompt_tokens=36944 generated_tokens=2
+duration=87.20s` while clearly loading the GPU. Findings on Ollama `0.33.1`:
+
+- The value is exactly what Ollama reports: llama.cpp's own timing log for
+  that request shows `eval time = 62.49 ms / 2 tokens` and
+  `prompt eval time = 38.7 s / 36944 tokens`, plus a cold model load of ~46 s
+  (keep-alive had expired). The 87 s was load + prompt evaluation; the model
+  genuinely sampled 2 tokens.
+- Usage is **not** visible-content-only and does **not** exclude reasoning:
+  `completion_tokens` maps 1:1 to llama.cpp's `predicted_n` (every sampled
+  token). A control request with visible thinking output reported
+  `completion_tokens=315` with the thinking streamed as `reasoning` deltas;
+  native `/api/chat` `eval_count` matches the same accounting.
+- Ollama `0.33.1` exposes **no separate reasoning-token usage** on either API
+  (`api.Metrics` has only prompt/eval counts). Reasoning tokens are included
+  in `ollama_generated_tokens_total` but cannot be broken out. The proxy does
+  not estimate them.
+- Kilo terminating a request makes it produce **no** token metrics (the
+  terminal usage event is never parsed); the proxy logs show such requests as
+  `status=200` with no token counts. Chained requests are metered per request.
+
+### Efficiency (tokens/kWh) interpretation
+
+Because `ollama_generated_tokens_total` includes reasoning but is
+output-only, output tokens/kWh is a poor efficiency measure for prompt-heavy
+agentic workloads (the investigated request did ~37k tokens of prompt work for
+2 output tokens). The dashboard therefore leads with **Processed tokens per
+kWh** (completed prompt + generated tokens) and **Prompt tokens per kWh**,
+with the output-only panel clearly labeled "Completed output tokens per kWh
+(while generating)". All energy denominators come from measured NVIDIA power
+telemetry.
+
 ## GPU metrics
 
 `nvidia_smi_*` series (utilization ratio, memory used/total bytes, power watts,
@@ -140,8 +189,10 @@ power to ~300 W). `Model VRAM` on the dashboard is Ollama's `size_vram` from
 `/api/ps` (exported as `ollama_model_ram_mb`).
 
 Energy estimates: "GPU energy over range" = avg power x duration (includes
-idle time); "tokens per kWh" panels divide token counts by that energy. These
-are rough, clearly-labeled estimates — not billing data.
+idle time); the tokens/kWh panels divide completed-token counts by that energy
+(see "Efficiency (tokens/kWh) interpretation" above for which token numerator
+each panel uses). These are rough, clearly-labeled estimates — not billing
+data.
 
 ## Survivability
 
