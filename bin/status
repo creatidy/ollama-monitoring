@@ -1,50 +1,67 @@
 #!/usr/bin/env bash
-# Overview of the monitoring stack: container health, endpoints, WSL IP match,
-# Prometheus scrape targets.
+# Overview of the monitoring stack: container health, endpoints, native
+# Ollama reachability, Prometheus scrape targets, journal collector liveness.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 fail=0
 ok()   { printf '  [ OK ] %s\n' "$1"; }
-warn() { printf '  [WARN] %s\n' "$1"; fail=1; }
+warn() { printf '  [WARN] %s\n' "$1"; }
 bad()  { printf '  [FAIL] %s\n' "$1"; fail=1; }
 
 echo "=== Containers ==="
 docker compose ps --format 'table {{.Name}}\t{{.Service}}\t{{.Status}}\t{{.Health}}' 2>/dev/null || bad "docker compose ps failed"
 
 echo
-echo "=== WSL IP ==="
-CUR_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-ENV_IP="$(grep '^WSL_HOST_IP=' .env 2>/dev/null | cut -d= -f2-)"
-if [[ -z "${CUR_IP}" ]]; then
-  bad "could not determine current WSL IP"
-elif [[ "${CUR_IP}" == "${ENV_IP}" ]]; then
-  ok "WSL IP ${CUR_IP} matches .env (proxy target current)"
+echo "=== Native Ollama (direct, not part of this stack) ==="
+if curl -sf -m 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+  ok "native Ollama on :11434 ($(curl -sf -m 3 http://127.0.0.1:11434/api/version))"
 else
-  warn "WSL IP changed: .env has ${ENV_IP}, current is ${CUR_IP}. Run ./bin/up to fix."
+  warn "native Ollama not reachable on :11434 (monitoring still works; clients need it)"
 fi
 
 echo
 echo "=== Endpoints ==="
-if curl -sf -m 3 http://127.0.0.1:11435/api/version >/dev/null; then
-  ok "native Ollama   : http://127.0.0.1:11435 ($(curl -sf -m 3 http://127.0.0.1:11435/api/version))"
+if curl -sf -m 3 http://127.0.0.1:9598/metrics >/dev/null; then
+  ok "journal collector  : http://localhost:9598/metrics"
 else
-  bad "native Ollama on :11435 not responding"
-fi
-if curl -sf -m 3 http://127.0.0.1:11434/api/version >/dev/null; then
-  ok "ollama proxy    : http://127.0.0.1:11434 ($(curl -sf -m 3 http://127.0.0.1:11434/api/version))"
-else
-  bad "proxy on :11434 not responding"
+  bad "journal collector on :9598 not responding"
 fi
 if curl -sf -m 3 http://127.0.0.1:9090/-/healthy >/dev/null; then
-  ok "Prometheus      : http://localhost:9090"
+  ok "Prometheus         : http://localhost:9090"
 else
   bad "Prometheus on :9090 not responding"
 fi
 if curl -sf -m 3 http://127.0.0.1:3000/api/health >/dev/null; then
-  ok "Grafana         : http://localhost:3000 ($(curl -sf -m 3 http://127.0.0.1:3000/api/health | grep -o '"database": *"[^"]*"'))"
+  ok "Grafana            : http://localhost:3000 ($(curl -sf -m 3 http://127.0.0.1:3000/api/health | grep -o '"database": *"[^"]*"'))"
 else
   bad "Grafana on :3000 not responding"
+fi
+
+echo
+echo "=== Journal collector self-observability ==="
+M="$(curl -sf -m 5 http://127.0.0.1:9598/metrics 2>/dev/null)"
+if [[ -z "${M}" ]]; then
+  bad "cannot read collector metrics"
+else
+  SEEN="$(printf '%s' "${M}" | grep -E '^ollama_journal_lines_seen_total' | awk '{print $2}' | tail -1)"
+  LAST="$(printf '%s' "${M}" | grep -E '^ollama_journal_last_event_timestamp_seconds' | awk '{print $2}' | tail -1)"
+  MATCHED="$(printf '%s' "${M}" | grep -cE '^ollama_journal_events_matched_total\{.*\} [0-9]')"
+  if python3 -c "exit(0 if float('${SEEN:-0}') > 0 else 1)" 2>/dev/null; then
+    ok "journal lines seen: ${SEEN%.*}"
+  else
+    bad "collector has not seen any journal lines"
+  fi
+  if [[ "${MATCHED}" -gt 0 ]]; then
+    ok "telemetry events matched: ${MATCHED} event series"
+  else
+    warn "no llama.cpp telemetry matched (parser/log-format mismatch?)"
+  fi
+  if [[ -n "${LAST}" ]] && python3 -c "import time; exit(0 if time.time() - float('${LAST}') < 600 else 1)" 2>/dev/null; then
+    ok "last relevant event: $(date -d "@${LAST%.*}" '+%H:%M:%S') (recent)"
+  else
+    warn "no relevant llama.cpp event in the last 10 minutes (idle system?)"
+  fi
 fi
 
 echo

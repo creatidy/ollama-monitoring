@@ -1,0 +1,3 @@
+slot   operator(): id  0 | task 13429 | new prompt, n_ctx_slot = 163840, n_keep = 4, task.n_tokens = 66059
+slot print_timing: id  0 | task 13429 | prompt processing, n_tokens =   3328, progress = 0.05, t = 3.10 s / 1072.67 tokens per second
+slot print_timing: id  0 | task 13429 | prompt processing, n_tokens =   3840, progress = 0.19, t =   3.72 s / 1033.56 tokens per second

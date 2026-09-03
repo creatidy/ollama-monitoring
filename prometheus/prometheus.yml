@@ -3,12 +3,13 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  # Ollama metrics proxy. Short interval keeps the counter-reset masking
-  # window (proxy restart + immediate traffic before next scrape) small.
-  - job_name: ollama
-    scrape_interval: 5s
+  # Journal metrics collector (Vector). The live gauges (tg_3s, prefill rate,
+  # progress) update with each llama.cpp status line, so a short scrape
+  # interval keeps the live view responsive without scraping absurdly fast.
+  - job_name: journal-metrics
+    scrape_interval: 2s
     static_configs:
-      - targets: ["ollama-proxy:8080"]
+      - targets: ["journal-metrics:9598"]
 
   # NVIDIA GPU (RTX 3090) via nvidia-smi passthrough.
   - job_name: nvidia-gpu

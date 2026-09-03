@@ -1,0 +1,4 @@
+slot launch_slot_: id  0 | task 1066 | processing task, is_child = 0
+slot   operator(): id  0 | task 1066 | new prompt, n_ctx_slot = 8192, n_keep = 0, task.n_tokens = 34
+slot      release: id  0 | task 1066 | stop processing: n_tokens = 34, truncated = 0
+srv  update_slots: all slots are idle

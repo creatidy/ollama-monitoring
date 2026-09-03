@@ -1,262 +1,237 @@
-# Ollama Monitoring
+# ollama-monitoring
 
-Durable local monitoring for native-WSL Ollama + RTX 3090, via Docker Compose:
-Prometheus metrics from a transparent Ollama API proxy, NVIDIA GPU telemetry,
-and an auto-provisioned Grafana dashboard.
+Passive performance monitoring for native Ollama on WSL2 with an NVIDIA GPU.
 
-## Quick start
+> **Ollama stays on its normal port.** Monitoring is passive: a collector reads
+> llama.cpp performance telemetry emitted by Ollama into the systemd journal and
+> exposes it to Prometheus. Clients do not route through the monitoring stack —
+> nothing sits between them and `:11434`.
 
-```bash
-cd ~/workspace/ollama-monitoring
-./bin/up        # start everything (also fixes the WSL IP if it changed)
-```
-
-Open **http://localhost:3000** — the Ollama dashboard is the Grafana home page.
-Login: see `.env` (defaults: `admin` / `ollama`).
-
-## Commands
-
-| Command | Purpose |
-|---|---|
-| `./bin/up` | Start / heal the stack. Resolves the current WSL IP into `.env` and recreates containers whose config changed. Safe to re-run anytime. |
-| `./bin/status` | Health overview: containers, WSL IP match, all four endpoints, Prometheus scrape targets. |
-| `./bin/test` | Full end-to-end validation (including real OpenAI-compatible streaming/non-streaming traffic, native regression, dashboards, GPU, and persistence). `--skip-persistence` for a quicker run. |
-| `./bin/down` | Stop. Keeps all data. Never uses `down -v`. |
-
-## URLs / ports
-
-| URL | Service | Exposure |
-|---|---|---|
-| `http://localhost:11434` | **Ollama API via metrics proxy** — use this as your normal Ollama endpoint | Windows + LAN (see below) |
-| `http://localhost:3000` | Grafana | localhost only |
-| `http://localhost:9090` | Prometheus UI | localhost only |
-| `http://127.0.0.1:11435` | Native Ollama (bypasses metering) | WSL/Windows localhost only, not LAN |
-
-**Point all clients at `:11434`.** Only traffic through the proxy is metered;
-requests sent directly to `:11435` are invisible to token accounting.
-
-## Architecture
-
-```
-clients / trusted LAN
+```text
+Kilo / other clients
         |
         v
-:11434  ollama-proxy (local build of NorskHelsenett/ollama-metrics)
-        |      in-memory Prometheus counters + transparent API forwarding
-        v
-:11435  native Ollama 0.33.1 (systemd service in WSL, NOT containerized)
-
-Prometheus (v3.14.0) scrapes:
-  - ollama-proxy:8080/metrics   every 5s  (job "ollama")
-  - nvidia-gpu-exporter:9835    every 10s (job "nvidia-gpu")
-  - itself                      every 15s
-
-Grafana 13.0.8 -> Prometheus, datasource + dashboard auto-provisioned from
-./grafana/. GPU metrics via utkuozdemir/nvidia_gpu_exporter:1.15.0 running
-with `gpus: all` (nvidia-smi is injected by WSL2 GPU passthrough; DCGM does
-not work on WSL2, which is why this exporter is used).
+Native Ollama on WSL :11434          (systemd service, NOT containerized)
+        |
+        +---- systemd journal / llama.cpp timing logs
+                          |
+                          v
+               journal metrics collector        (Vector, container)
+                          |
+                          v
+                     Prometheus
+                      /      \
+          NVIDIA GPU exporter  Grafana
 ```
 
-## Persistent data
+## Why journald
 
-All durable state lives in **`./data/`** (bind mounts, survives container
-recreation, Docker Desktop restarts, WSL restarts):
+Ollama runs its inference through llama.cpp (`llama-server`). Every request
+produces live engine telemetry in the `ollama.service` journal:
 
-- `./data/prometheus/` — Prometheus TSDB (90-day retention)
-- `./data/grafana/`   — Grafana DB, users, plugins
+```text
+slot print_timing: id 0 | task 13429 | prompt processing, n_tokens = 3840, progress = 0.19, t = 3.72 s / 1033.56 tokens per second
+slot print_timing: id 0 | task 13429 | n_gen = 1466, tg = 22.55 t/s, tg_3s = 22.31 t/s
+slot print_timing: id 0 | task 13429 | prompt eval time = 298.31 ms / 28 tokens (10.65 ms per token, 93.86 tokens per second)
+slot print_timing: id 0 | task 13429 |        eval time = 8974.02 ms / 322 tokens (27.89 ms per token, 35.77 tokens per second)
+slot print_timing: id 0 | task 13429 |       total time = 9272.34 ms / 350 tokens
+```
 
-Both are excluded from Git via `.gitignore`.
+This is the *actual compute engine* speaking. It reports live prefill speed and
+live decode speed (`tg`, `tg_3s`) while a request is running — something the
+previous HTTP-proxy architecture could never measure (it only saw terminal
+usage counters, and deriving decode speed from `rate(token_counter)` measures
+completion booking, not decode). It also exposes prompt-cache behavior that is
+invisible at the HTTP layer.
 
-## Dynamic WSL addressing
+An earlier iteration of this project used an HTTP proxy in the inference path
+to reconstruct metrics from OpenAI usage fields. That architecture was removed
+entirely: it metered only proxied traffic, could not see live t/s, complicated
+streaming, and forced Ollama onto a nonstandard port.
 
-The Ollama backend listens on the WSL distro's NAT address (e.g.
-`172.22.x.x`), which changes on Windows/WSL restarts. `host.docker.internal`
-does **not** reach it (it points at the Docker Desktop VM/Windows side).
+## Components (all monitoring in Docker Compose)
 
-Solution: `bin/up` reads the current WSL IP (`ip route get 1.1.1.1`) and writes
-it to `.env` as `WSL_HOST_IP`; `compose.yaml` passes it to the proxy as
-`OLLAMA_HOST`. When the IP changes, re-running `./bin/up` rewrites `.env` and
-Compose automatically recreates only the proxy container. No IP is ever baked
-into tracked config (`bin/test` checks this).
+| Service            | Image                            | Purpose                                        |
+|--------------------|----------------------------------|------------------------------------------------|
+| `journal-metrics`  | `timberio/vector:0.49.0-debian`  | Reads host journal, exports Prometheus metrics |
+| `prometheus`       | `prom/prometheus:v3.14.0`        | Scrapes collector (2s) and GPU exporter (10s)  |
+| `grafana`          | `grafana/grafana:13.0.8`         | Dashboards                                     |
+| `nvidia-gpu-exporter` | `utkuozdemir/nvidia_gpu_exporter:1.15.0` | GPU power/utilization/VRAM/temp    |
 
-## Token accounting — exact semantics
+There is no proxy service. Port 11434 belongs exclusively to native Ollama.
 
-The proxy exposes `ollama_prompt_tokens_total` / `ollama_generated_tokens_total`
-as **in-memory cumulative counters**. Prometheus handles counter resets, and
-the design keeps residual error small and bounded:
+## Supported environment
 
-- **Planned restarts** (`bin/up`, `bin/down` + `bin/up`, boot-time start):
-  effectively **exact**. No traffic flows while the proxy starts, so the first
-  scrape observes the fresh counter and Prometheus records the reset. Verified:
-  `increase()` matched the true request counts exactly.
-- **Restart + request completing within one 5 s scrape window** (the only
-  masking case): if the post-restart counter value is >= the last pre-restart
-  scrape, Prometheus cannot see that a reset happened and `increase()`
-  undercounts by the pre-restart total. Verified by deliberately racing the
-  scrape (lost 23 of 60 prompt tokens in a test). This matters only shortly
-  after a fresh proxy start, when cumulative values are still small; after a
-  long uptime the cumulative total exceeds any single request, so resets are
-  always detected.
-- **Requests in flight during a crash**: lost (at most ~5 s of traffic).
-  Inherent to any scrape-based design.
-- **Client-cancelled streams** (e.g. Kilo aborts a request): the terminal
-  usage event never arrives, so those tokens stay uncounted. The
-  `ollama_inflight_requests` gauge still drops to 0.
+* WSL2 with systemd enabled (Ubuntu), Ollama installed as a native systemd
+  service (`ollama.service`), listening on `:11434`.
+* Docker Desktop (or docker engine) in WSL; NVIDIA GPU passthrough for
+  `nvidia-smi`.
+* The collector image is the stock Vector image: it already ships the
+  `journalctl` binary that Vector's journald source requires (verified for the
+  pinned tag). No custom image build is needed.
 
-The 5 s scrape interval on the `ollama` job keeps all these windows small.
-There is no billing-grade exactness here; daily/weekly/monthly answers from
-`increase(metric[24h])` etc. are reliable for personal use.
+## Journal access from the collector container
 
-### OpenAI-compatible chat completions
+The collector reads the **host** journal read-only with minimum privilege:
 
-The local proxy build also parses Ollama's OpenAI-compatible usage shape from
-`/v1/chat/completions`:
+* `/var/log/journal` → read-only (this WSL instance keeps a persistent journal
+  here; adjust if yours only has `/run/log/journal`, which is also mounted).
+* `/etc/machine-id` → read-only (lets `journalctl` find the right journal).
+* The container runs as `user: "1000:1000"` with `group_add: ["999"]` — the
+  host gid of `systemd-journal` (check with `getent group systemd-journal`).
+  Journal files are `root:systemd-journal` mode `0640`, so the group grant is
+  sufficient. No `--privileged`, no Docker socket, no host PID namespace, no
+  writable host paths.
+* Filtering happens inside `journalctl` (`--unit=ollama.service`); the
+  collector only sees Ollama's own unit, current boot only.
 
-- Non-streaming responses use `usage.prompt_tokens` and
-  `usage.completion_tokens`.
-- Streaming requests are forwarded as SSE immediately and the final usage
-  event is parsed.
-- For a streaming request that does not already set
-  `stream_options.include_usage=true`, the proxy adds that option only on the
-  upstream request. Ollama `0.33.1` then reports exact counts in its final
-  usage-only SSE event.
-- The proxy consumes that added usage-only event before forwarding the
-  response, so clients that did not request usage receive the same normal
-  chunks and `data: [DONE]` as before. If the client already requested usage,
-  the event passes through unchanged.
+The Vector journald checkpoint (read cursor) is persisted in
+`./data/vector`, so restarting or recreating the collector resumes where it
+stopped instead of replaying the boot into the counters. On the very first
+start (or after wiping `./data/vector`) the collector ingests the *current
+boot's* backlog once; counters jump accordingly and Prometheus handles it as a
+counter reset. This is local observability — not billing-grade persistence.
 
-The custom image source is under `./proxy/`. It is based on upstream
-`NorskHelsenett/ollama-metrics` revision
-`02911ce53b5b14cff172163cd5858854dd0148e3`, the source revision recorded by
-the former pinned image
-(`sha256:3dd32882666cf0e77272086446b5639c636fb090ac9ea629c11874200c629164`).
-The upstream OpenAI usage changes are still unmerged, so the endpoint parser
-and streaming handling are maintained as a narrow local patch. `bin/up` builds
-this image through Compose; no manually built image is required.
+## Metric semantics
 
-### Streaming usage timing and live state
+Three concepts are kept strictly apart:
 
-For OpenAI-compatible streaming requests, Ollama reports exact usage in the
-terminal usage event. Token totals therefore update at request completion
-rather than token-by-token. The dashboard exposes an in-flight inference
-indicator so active work is visible immediately: the proxy exports
-`ollama_inflight_requests` (gauge, labeled by endpoint for `/v1/chat/completions`,
-`/api/chat`, `/api/generate`) for the full lifetime of each metered request,
-including errors and client disconnects, and the "Inference state" panel shows
-`ACTIVE` / `IDLE` with a 5 s dashboard refresh. Token panels are named
-"Completed …" because they only reflect requests that have finished.
+1. **Live engine telemetry** — gauges from llama.cpp status lines, meaningful
+   only while a request runs. They are zeroed on slot release, so an idle
+   system shows zeros, never stale speeds.
+2. **Completed compute work** — counters/histograms from final per-request
+   timing lines (tokens/durations the engine actually computed).
+3. **Logical/request token counts** — from `task.n_tokens`, the submitted
+   prompt size *including* tokens served from cache.
 
-### `generated_tokens=2` investigation (2026-09-03)
+### Token semantics (measured, not assumed)
 
-A real Kilo request reported `prompt_tokens=36944 generated_tokens=2
-duration=87.20s` while clearly loading the GPU. Findings on Ollama `0.33.1`:
+Controlled warm/cold experiments (repeating an identical prompt) show:
 
-- The value is exactly what Ollama reports: llama.cpp's own timing log for
-  that request shows `eval time = 62.49 ms / 2 tokens` and
-  `prompt eval time = 38.7 s / 36944 tokens`, plus a cold model load of ~46 s
-  (keep-alive had expired). The 87 s was load + prompt evaluation; the model
-  genuinely sampled 2 tokens.
-- Usage is **not** visible-content-only and does **not** exclude reasoning:
-  `completion_tokens` maps 1:1 to llama.cpp's `predicted_n` (every sampled
-  token). A control request with visible thinking output reported
-  `completion_tokens=315` with the thinking streamed as `reasoning` deltas;
-  native `/api/chat` `eval_count` matches the same accounting.
-- Ollama `0.33.1` exposes **no separate reasoning-token usage** on either API
-  (`api.Metrics` has only prompt/eval counts). Reasoning tokens are included
-  in `ollama_generated_tokens_total` but cannot be broken out. The proxy does
-  not estimate them.
-- Kilo terminating a request makes it produce **no** token metrics (the
-  terminal usage event is never parsed); the proxy logs show such requests as
-  `status=200` with no token counts. Chained requests are metered per request.
+| line                                      | cold run | warm repeat |
+|-------------------------------------------|----------|-------------|
+| `new prompt, task.n_tokens` (logical)     | 44       | 44          |
+| `prompt eval time ... / N tokens` (engine)| 44       | 4           |
 
-### Efficiency (tokens/kWh) interpretation
+So `task.n_tokens` is the *submitted* prompt size, while the final prompt-eval
+line counts only tokens the engine *actually evaluated*. Metric names encode
+this: `ollama_prompt_tokens_submitted_total` (logical, includes cache hits and
+embedding tasks) vs `ollama_prompt_evaluated_tokens_total` (real prefill
+compute). Efficiency metrics use the *evaluated* number — cached tokens are
+not counted as computation.
 
-Because `ollama_generated_tokens_total` includes reasoning but is
-output-only, output tokens/kWh is a poor efficiency measure for prompt-heavy
-agentic workloads (the investigated request did ~37k tokens of prompt work for
-2 output tokens). The dashboard therefore leads with **Processed tokens per
-kWh** (completed prompt + generated tokens) and **Prompt tokens per kWh**,
-with the output-only panel clearly labeled "Completed output tokens per kWh
-(while generating)". All energy denominators come from measured NVIDIA power
-telemetry.
+### Live metrics (gauges, per slot; `slot` is the finite llama.cpp slot id)
 
-## GPU metrics
+| metric                                        | source                                   |
+|-----------------------------------------------|------------------------------------------|
+| `ollama_slot_active{slot}`                    | 1 on `processing task`, 0 on `release`   |
+| `ollama_slot_phase_prefill{slot}` / `..._decode{slot}` | phase gauges (0/1)               |
+| `ollama_slots_idle`                           | 0/1 safety net from "all slots are idle" |
+| `ollama_live_prompt_total_tokens{slot}`       | `task.n_tokens` (submitted size)         |
+| `ollama_live_prompt_processed_tokens{slot}`   | `n_tokens` so far in prefill             |
+| `ollama_live_prompt_progress_ratio{slot}`     | prefill `progress`                       |
+| `ollama_live_prompt_tokens_per_second{slot}`  | prefill t/s                              |
+| `ollama_live_prompt_elapsed_seconds{slot}`    | prefill elapsed `t`                      |
+| `ollama_live_generated_tokens{slot}`          | `n_gen` (legacy `n_decoded` also parsed) |
+| `ollama_live_decode_tokens_per_second{slot}`  | `tg` — request-average decode so far     |
+| `ollama_live_decode_tokens_per_second_3s{slot}` | `tg_3s` — engine's trailing 3s decode  |
 
-`nvidia_smi_*` series (utilization ratio, memory used/total bytes, power watts,
-temperature, fan) collected from `nvidia-smi -q` inside a `--gpus all`
-container. Verified to react to real inference load (utilization to ~92 %,
-power to ~300 W). `Model VRAM` on the dashboard is Ollama's `size_vram` from
-`/api/ps` (exported as `ollama_model_ram_mb`).
+`tg_3s` is the authoritative live generation speed; `tg` is the request
+average so far. Do **not** derive decode speed from
+`rate(ollama_generated_tokens_total[...])` — that measures completion booking.
 
-Energy estimates: "GPU energy over range" = avg power x duration (includes
-idle time); the tokens/kWh panels divide completed-token counts by that energy
-(see "Efficiency (tokens/kWh) interpretation" above for which token numerator
-each panel uses). These are rough, clearly-labeled estimates — not billing
-data.
+### Completed metrics (counters/histograms)
 
-## Survivability
+| metric                                          | meaning                                   |
+|-------------------------------------------------|-------------------------------------------|
+| `ollama_prompt_tokens_submitted_total`          | logical submitted prompt tokens           |
+| `ollama_prompt_evaluated_tokens_total`          | prompt tokens actually evaluated          |
+| `ollama_prompt_eval_seconds_total`              | time spent evaluating prompts             |
+| `ollama_prompt_eval_tokens_per_second`          | per-request prefill t/s (histogram)       |
+| `ollama_generated_tokens_total`                 | generated tokens (incl. reasoning tokens) |
+| `ollama_decode_seconds_total`                   | decode time                               |
+| `ollama_decode_tokens_per_second`               | per-request average decode t/s (histogram)|
+| `ollama_compute_seconds_total`                  | llama.cpp "total time"                    |
+| `ollama_compute_tokens_total`                   | evaluated + generated tokens              |
+| `ollama_http_requests_total{method,path,status}`| passive count from Ollama's GIN log lines |
+| `ollama_http_request_duration_seconds`          | request duration (histogram)              |
 
-- All services have `restart: unless-stopped` → containers come back with the
-  Docker engine (after `docker compose restart`, Docker Desktop restart, WSL
-  restart — as long as Docker Desktop starts, which it does by default at
-  Windows login).
-- After a full Windows restart: start Docker Desktop (automatic), then run
-  `./bin/up` once so the proxy picks up the new WSL IP.
-- Ollama itself is a systemd service in WSL (`ollama.service`, enabled) and is
-  not managed by this stack.
+Completed counters only include requests the engine has *finished*; a range
+that cuts through an in-flight request does not include it yet.
+
+### Prompt-cache metrics
+
+| metric                                        | source                              |
+|-----------------------------------------------|-------------------------------------|
+| `ollama_prompt_cache_entries`                 | `cache state: N prompts, ...`       |
+| `ollama_prompt_cache_bytes`                   | `cache state: ..., X MiB`           |
+| `ollama_prompt_cache_update_duration_seconds` | `prompt cache update took ... ms`   |
+| `ollama_prompt_cache_full_reprocess_total`    | `forcing full prompt re-processing` |
+| `ollama_prompt_cache_evictions_total`         | `removing oldest entry`             |
+
+Speculative decoding: current Ollama/llama.cpp logs on this setup emit no
+draft-acceptance lines, so no such metrics exist. If a future version adds
+them, extend the parser deliberately (a new explicit variant), not permissively.
+
+### Model labels
+
+llama.cpp task lines do not carry a trustworthy model identity (only the
+llama-server launch command does, with a blob hash). With
+`OLLAMA_MAX_LOADED_MODELS=1`, slot-level metrics without a model label are
+unambiguous in practice. Attaching a model name would require re-introducing
+HTTP polling of Ollama; that trade-off was rejected on purpose.
+
+## Collector self-observability
+
+* `ollama_journal_lines_seen_total` — every ollama.service journal line seen.
+* `ollama_journal_events_matched_total{event=...}` — parsed telemetry per
+  category (lifecycle, timings, cache, http).
+* `ollama_journal_last_event_timestamp_seconds` — last relevant event.
+
+Unmatched rate ≈ `rate(lines_seen) - sum(rate(events_matched))`. A large
+unmatched share after an Ollama upgrade usually means the llama.cpp log
+format changed — the Grafana "Collector health" row visualizes this.
+
+## The llama.cpp log format is not a stable API
+
+The parser targets the exact line shapes Ollama 0.33.1 emits (verified). A
+future Ollama/llama.cpp can reword them, in which case live/completed metrics
+go quiet while `lines_seen_total` keeps rising — that asymmetry is the
+upgrade alarm. **After every major Ollama upgrade, run `./bin/test` and check
+the collector health panels.** The parser intentionally uses explicit variants
+(e.g. `n_gen` and legacy `n_decoded`) rather than one overly permissive regex,
+and drops lines it cannot fully parse instead of emitting nonsense values.
+
+## Usage
+
+```bash
+./bin/up        # start monitoring (config sanity checks included)
+./bin/status    # health overview: containers, Ollama, collector, targets
+./bin/down      # stop monitoring (keeps ./data)
+./bin/test      # unit + static tests (no stack required)
+./bin/test --live --security --restart   # full validation vs running stack
+```
+
+`.env` only holds Grafana credentials. Grafana: <http://localhost:3000>,
+Prometheus: <http://localhost:9090>, collector: <http://localhost:9598/metrics>.
+
+## Privacy
+
+The collector parses only the operational/timing lines listed above. Prompt
+text, responses, tool arguments, and raw logs are never exported or persisted;
+no metric label carries user content (verified by `tests/test_security.sh`,
+which sends a unique marker through Ollama and asserts it never appears in
+`/metrics`). No Loki, no OpenTelemetry, no additional database.
 
 ## Security notes
 
-- 11434 is published on all interfaces: Docker Desktop binds it on the Windows
-  host, and Docker Desktop's built-in firewall rules allow `com.docker.backend`
-  on **Private** networks only (blocked on Public). Your LAN must be marked
-  Private in Windows. To restrict further, run elevated PowerShell:
-  `New-NetFirewallRule -DisplayName "Ollama proxy 11434" -Direction Inbound -Protocol TCP -LocalPort 11434 -RemoteAddress LocalSubnet -Action Allow`
-  (plus disabling the broad Docker Desktop allow rule, if you want).
-- 11435 (native Ollama) is bound inside WSL only; Windows NAT does not forward
-  it to the LAN.
-- Grafana/Prometheus bind `127.0.0.1` on the WSL + Windows side.
-- The proxy and GPU-exporter images are distroless (no shell), so they cannot
-  have in-container healthchecks; the two data services do (Prometheus uses
-  `/-/ready`, which also gates Grafana startup).
-- Prometheus and Grafana run as root inside their containers because the
-  `./data` bind mounts are owned by the WSL user and there is no passwordless
-  sudo to chown them to the images' UIDs. Acceptable for a localhost-bound
-  personal stack.
+Monitoring containers run localhost-only. Prometheus and Grafana run as root
+inside their containers because `./data` bind mounts are owned by the WSL user
+(no passwordless sudo to chown for the default uids) — acceptable for a
+personal, loopback-bound stack. The collector runs as uid 1000 with only the
+`systemd-journal` supplementary group; all host mounts are read-only.
 
-## Upgrading images
+## Data persistence
 
-Prometheus, Grafana, and the NVIDIA exporter remain pinned
-(`prom/prometheus:v3.14.0`, `grafana/grafana:13.0.8`,
-`nvidia_gpu_exporter:1.15.0`). The Ollama proxy is built locally from
-`./proxy/` so its parser fix is reproducible. To upgrade:
-
-1. `./bin/down`
-2. Update the proxy source/Dockerfile under `proxy/` when intentionally
-   rebasing the local patch onto a newer upstream revision.
-3. `./bin/up && ./bin/test`
-
-Data survives upgrades (it lives in `./data/`). If a new Grafana major version
-migrates the DB, it cannot be trivially rolled back — back up first (below).
-
-## Backups
-
-```bash
-cd ~/workspace/ollama-monitoring
-./bin/down   # or leave running for a slightly less consistent copy
-tar czf ollama-monitoring-data-$(date +%F).tar.gz data/
-```
-
-Restore: extract over `data/`, then `./bin/up`. Grafana state (users,
-dashboards edited in the UI) and all Prometheus history are inside `data/`;
-provisioned config lives in `grafana/` and `prometheus/` (in Git).
-
-## Complete removal
-
-`./bin/down` stops everything (containers removed; the proxy no longer holds
-port 11434). To wipe monitoring **data** too: `rm -rf data/` — this deletes all
-Prometheus history and Grafana state permanently. Uninstall = delete the
-project directory; nothing else is installed system-wide.
-
-Legacy leftover from earlier experiments (safe to delete, not used here):
-`sudo rm -rf /var/lib/ollama-monitoring/`.
+Prometheus (90d retention) and Grafana state live in `./data/` and survive
+container recreation. The Vector journald cursor lives in `./data/vector/`.

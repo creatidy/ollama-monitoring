@@ -1,3 +1,5 @@
 data/
 .env
-*.log
+!.gitkeep
+tests/generated_tests.toml
+tests/__pycache__/

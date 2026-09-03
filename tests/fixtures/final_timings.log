@@ -1,0 +1,4 @@
+slot print_timing: id  0 | task 13429 | prompt eval time =   81198.50 ms / 66059 tokens (    1.23 ms per token,   813.55 tokens per second)
+slot print_timing: id  0 | task 13429 |        eval time =   90913.50 ms /  2048 tokens (   44.41 ms per token,    22.52 tokens per second)
+slot print_timing: id  0 | task 13429 |       total time =  172112.00 ms / 68107 tokens
+slot print_timing: id  0 | task 13429 |    graphs reused =      13456

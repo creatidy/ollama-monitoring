@@ -1,23 +1,42 @@
 name: ollama-monitoring
 
 services:
-  ollama-proxy:
-    image: ollama-monitoring/ollama-proxy:local
-    build:
-      context: ./proxy
-      dockerfile: Dockerfile
-    container_name: ollama-proxy
+  # Passive collector: reads the WSL host systemd journal for ollama.service
+  # and exports llama.cpp timing telemetry to Prometheus. Sits outside the
+  # inference path; clients talk to native Ollama directly.
+  journal-metrics:
+    image: timberio/vector:0.49.0-debian
+    container_name: ollama-journal-metrics
     restart: unless-stopped
-    environment:
-      # Native Ollama runs in WSL (systemd), NOT in Docker. host.docker.internal
-      # does not reach it, so bin/up resolves the current WSL IP into .env.
-      # bin/up rewrites .env when the IP changes; `docker compose up -d` then
-      # recreates this container automatically.
-      OLLAMA_HOST: http://${WSL_HOST_IP}:11435
+    command: ["--config", "/etc/vector/vector.toml"]
+    # Run as non-root (uid 1000) but with the host systemd-journal group
+    # (gid 999 on this host: `getent group systemd-journal`) so journal files
+    # (root:systemd-journal, mode 0640) are readable without any privilege.
+    user: "1000:1000"
+    group_add:
+      - "999"
+    volumes:
+      # Mount the whole directory: single-file bind mounts go stale when the
+      # file's inode is replaced (Docker Desktop / WSL2).
+      - ./collector:/etc/vector:ro
+      # Host journal, read-only. This WSL instance keeps a persistent journal
+      # in /var/log/journal; /run/log/journal is mounted for setups that only
+      # have the volatile one. /etc/machine-id tells journalctl which files
+      # belong to this host.
+      - /var/log/journal:/var/log/journal:ro
+      - /run/log/journal:/run/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      # Persistent journald cursor: after a collector restart, reading resumes
+      # where it stopped instead of replaying the boot into the counters.
+      - ./data/vector:/var/lib/vector-data
     ports:
-      # Published on all interfaces so Docker Desktop also binds it on the
-      # Windows host -> reachable from the trusted LAN (firewall rule required).
-      - "11434:8080"
+      - "127.0.0.1:9598:9598"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8686 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   nvidia-gpu-exporter:
     image: utkuozdemir/nvidia_gpu_exporter:1.15.0

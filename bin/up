@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Start the monitoring stack. Resolves the current WSL IP so the proxy can
-# reach native Ollama on :11435, writes it to .env, then brings up compose.
+# Start the monitoring stack (journal collector, Prometheus, Grafana, GPU
+# exporter). Monitoring is passive: nothing here touches Ollama, discovers
+# WSL IPs, or proxies inference traffic.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -9,32 +10,35 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-WSL_HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-if [[ -z "${WSL_HOST_IP}" ]]; then
-  echo "ERROR: could not determine WSL IP address" >&2
-  exit 1
-fi
-
-# Create or refresh .env (preserves user-edited Grafana credentials).
 if [[ ! -f .env ]]; then
   cp .env.example .env
 fi
-if grep -q '^WSL_HOST_IP=' .env; then
-  PREV_IP="$(grep '^WSL_HOST_IP=' .env | cut -d= -f2-)"
-  if [[ "${PREV_IP}" != "${WSL_HOST_IP}" ]]; then
-    echo "WSL IP changed: ${PREV_IP} -> ${WSL_HOST_IP} (recreating proxy)"
-    sed -i "s|^WSL_HOST_IP=.*|WSL_HOST_IP=${WSL_HOST_IP}|" .env
+
+# The cursor directory is intentionally ignored by git. Create it as the WSL
+# user so the non-root collector can persist its checkpoint on a fresh clone.
+mkdir -p data/vector
+
+# Sanity: the journal collector must be able to read the host journal. This is
+# a read-only check of the paths mounted into the collector container.
+for p in /var/log/journal /run/log/journal /etc/machine-id; do
+  if [[ ! -e "$p" ]]; then
+    echo "WARNING: $p does not exist on the host; the collector may find no journal." >&2
   fi
-else
-  printf '\nWSL_HOST_IP=%s\n' "${WSL_HOST_IP}" >> .env
+done
+if ! journalctl -u ollama -n 1 --no-pager >/dev/null 2>&1; then
+  echo "WARNING: current user cannot read the ollama journal; inside the" >&2
+  echo "container the systemd-journal group (group_add in compose.yaml) is" >&2
+  echo "what grants access - verify with: ./bin/status" >&2
 fi
 
-docker compose up -d --build --remove-orphans
+docker compose up -d --remove-orphans
 
-# Wait for readiness via healthchecks (no fixed sleeps where avoidable).
-# Only services that define healthchecks are expected to report healthy;
-# the others (proxy, gpu exporter) have no in-container healthcheck because
-# their images are distroless (no shell/wget).
+# journal-metrics and prometheus consume bind-mounted config files. A file's
+# inode can be replaced by edits, and an existing container would keep the
+# stale mount, so always recreate the two config consumers.
+docker compose up -d --force-recreate --remove-orphans journal-metrics prometheus
+
+# Wait for readiness via healthchecks.
 echo "Waiting for services to become healthy..."
 for _ in $(seq 1 60); do
   HEALTHY="$(docker compose ps --format '{{.Health}}' 2>/dev/null | grep -c '^healthy$' || true)"
@@ -46,7 +50,8 @@ for _ in $(seq 1 60); do
     echo
     echo "  Grafana    : http://localhost:3000  (login: see .env)"
     echo "  Prometheus : http://localhost:9090"
-    echo "  Ollama API : http://localhost:11434  (proxy -> native Ollama :11435)"
+    echo "  Collector  : http://localhost:9598/metrics"
+    echo "  Ollama     : native on :11434 (not part of this stack)"
     exit 0
   fi
   sleep 2

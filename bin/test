@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-# End-to-end validation of the monitoring stack.
-# Usage: ./bin/test [--skip-persistence]
+# Test suite for the monitoring stack.
+#
+#   ./bin/test              unit tests + static checks (no stack required)
+#   ./bin/test --live       additionally validates against the RUNNING stack
+#                           and native Ollama (real request, phase lifecycle,
+#                           tg_3s live match, final counts vs API)
+#   ./bin/test --security   security/privacy checks (stack running)
+#   ./bin/test --restart    collector restart/cursor behavior (stack running)
+#
+# --live requires native Ollama on :11434 (override with OLLAMA_PORT).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL="${OLLAMA_MODEL:-qwen3.8:27b-3090-q4km-160k}"
-SKIP_PERSISTENCE=0
-[[ "${1:-}" == "--skip-persistence" ]] && SKIP_PERSISTENCE=1
-
+IMAGE="$(grep -m1 '^    image: timberio/vector' compose.yaml | awk '{print $2}')"
+mkdir -p /tmp/kilo/vector-data
+VECTOR="docker run --rm -v $PWD/collector:/etc/vector:ro -v $PWD/tests:/opt/tests:ro -v /tmp/kilo/vector-data:/var/lib/vector-data --entrypoint vector ${IMAGE}"
 PASS=0; FAIL=0
 check() { # check <name> <cmd...>
   local name="$1"; shift
@@ -17,556 +24,59 @@ check() { # check <name> <cmd...>
     echo "  [FAIL] ${name}"; FAIL=$((FAIL+1)); return 1
   fi
 }
-prom_query() { curl -sf -m 10 "http://127.0.0.1:9090/api/v1/query" --data-urlencode "query=$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["result"][0]["value"][1])' 2>/dev/null; }
-prom_value_sum() { curl -sf -m 10 "http://127.0.0.1:9090/api/v1/query" --data-urlencode "query=$1" | python3 -c '
-import json,sys
-d=json.load(sys.stdin)
-print(sum(float(r["value"][1]) for r in d["data"]["result"]))' 2>/dev/null; }
-prom_model_value() {
-  prom_value_sum "sum($1{model=\"${MODEL}\"})"
-}
-proxy_metric_sum() { # exact current value of a proxy metric, read from the proxy itself (no scrape lag)
-  curl -sf -m 5 http://127.0.0.1:11434/metrics | python3 -c '
-import re, sys
-name = sys.argv[1]
-total = 0.0
-for line in sys.stdin:
-    line = line.strip()
-    if not line or line.startswith("#"):
-        continue
-    m = re.match(r"^(\w+)(\{[^}]*\})?\s+([-+0-9.eE]+)$", line)
-    if m and m.group(1) == name:
-        total += float(m.group(3))
-print(total)' "$1" 2>/dev/null
-}
-wait_proxy_inflight() { # wait_proxy_inflight <want> <timeout-seconds>; exit 0 when the gauge reaches <want>
-  local want="$1" timeout="$2" got=""
-  for _ in $(seq 1 "$((timeout * 4))"); do
-    got="$(proxy_metric_sum ollama_inflight_requests)"
-    if python3 -c "exit(0 if abs(float('${got:-0}') - ${want}) < 0.001 else 1)" 2>/dev/null; then
-      return 0
-    fi
-    sleep 0.25
-  done
-  return 1
-}
-gpu_direct_sample() { # print "util_percent power_watts" straight from nvidia-smi (no scrape lag)
-  docker run --rm --gpus all --entrypoint /usr/bin/nvidia-smi utkuozdemir/nvidia_gpu_exporter:1.15.0 \
-    --query-gpu=utilization.gpu,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1
-}
-sync_prom_to_proxy() { # sync_prom_to_proxy <metric>; ensure Prometheus's instant value equals the proxy's live counter so before/after baselines cannot be polluted by a pre-restart sample. A fresh proxy exposes no token series until first traffic, and Prometheus keeps serving the old sample within its 5-minute lookback, so prime the counters with a tiny metered request first.
-  curl -sf -m 300 http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' \
-    -d "{\"model\":\"${MODEL}\",\"prompt\":\"hi\",\"stream\":false,\"options\":{\"num_predict\":1}}" >/dev/null 2>&1
-  local metric="$1" proxy_val prom_val
-  for _ in $(seq 1 30); do
-    proxy_val="$(proxy_metric_sum "$metric")"
-    prom_val="$(prom_value_sum "sum($metric)")"
-    if python3 -c "exit(0 if abs(float('${prom_val:-nan}') - float('${proxy_val:-nan}')) < 0.001 else 1)" 2>/dev/null; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
-wait_for_exact_model_delta() {
-  local metric="$1" before="$2" expected="$3" label="$4"
-  local after=0 delta=0
-  if ! python3 -c "exit(0 if float('${expected}') > 0 else 1)" 2>/dev/null; then
-    echo "  [FAIL] ${label}: no positive Ollama usage was reported"
-    FAIL=$((FAIL+1))
-    return 1
-  fi
-  for _ in $(seq 1 30); do
-    sleep 1
-    after="$(prom_model_value "${metric}")"; after="${after:-0}"
-    delta="$(python3 -c "print(float('${after}') - float('${before}'))" 2>/dev/null || echo -999)"
-    if python3 -c "import math; exit(0 if math.isclose(float('${delta}'), float('${expected}'), abs_tol=0.001) else 1)" 2>/dev/null; then
-      echo "  [ OK ] ${label}: ${delta} tokens (expected ${expected})"
-      PASS=$((PASS+1))
-      return 0
-    fi
-  done
-  echo "  [FAIL] ${label}: ${delta} tokens (expected ${expected}, before=${before}, after=${after})"
-  FAIL=$((FAIL+1))
-  return 1
-}
-run_stream_probe() {
-  local endpoint="$1" include_usage="$2" kilo_like="${3:-0}"
-  python3 - "${endpoint}" "${MODEL}" "${include_usage}" "${kilo_like}" <<'PYEOF'
-import json
-import sys
-import time
-import urllib.request
 
-endpoint, model, include_usage, kilo_like = sys.argv[1:]
-if kilo_like == "1":
-    # Workload shaped like Kilo Code's streaming requests: a system prompt,
-    # a user task, and a tool the model may call. Thinking stays at the
-    # model default so reasoning tokens are generated like in real traffic.
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a coding assistant. Be brief."},
-            {"role": "user", "content": "Use the tool to note the file main.go, then write at least 150 words explaining how you would test a REST API endpoint."},
-        ],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": "note_file",
-                "description": "Note a file for later reference",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
-            },
-        }],
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "temperature": 0,
-        "seed": 20260903,
-        "max_tokens": 512,
-    }
-else:
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "Reply with exactly: STREAM-MONITORING-OK"}],
-        "stream": True,
-        "temperature": 0,
-        "seed": 20260903,
-        "max_tokens": 200,
-    }
-if include_usage == "1":
-    payload["stream_options"] = {"include_usage": True}
-else:
-    payload.pop("stream_options", None)
-
-started = time.monotonic()
-chunks = 0
-usage_events = 0
-usage = None
-first_data = None
-first_token = None
-done = False
-try:
-    request = urllib.request.Request(
-        endpoint + "/v1/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=300) as response:
-        content_type = response.headers.get("Content-Type", "")
-        if "text/event-stream" not in content_type:
-            raise RuntimeError("response was not text/event-stream: " + content_type)
-        for raw_line in response:
-            line = raw_line.decode("utf-8").strip()
-            if not line or not line.startswith("data:"):
-                continue
-            data = line.split(":", 1)[1].strip()
-            if data == "[DONE]":
-                done = True
-                continue
-            chunk = json.loads(data)
-            chunks += 1
-            now = time.monotonic() - started
-            if first_data is None:
-                first_data = now
-            choices = chunk.get("choices")
-            if not isinstance(choices, list):
-                raise RuntimeError("SSE chunk has no choices array")
-            if choices:
-                delta = choices[0].get("delta") or {}
-                if first_token is None and any(delta.get(key) for key in ("content", "reasoning", "reasoning_content", "tool_calls")):
-                    first_token = now
-            if chunk.get("usage") is not None:
-                usage_events += 1
-                usage = chunk["usage"]
-    total = time.monotonic() - started
-    if not done:
-        raise RuntimeError("stream did not terminate with data: [DONE]")
-    print(json.dumps({
-        "chunks": chunks,
-        "usage_events": usage_events,
-        "prompt_tokens": (usage or {}).get("prompt_tokens", 0),
-        "completion_tokens": (usage or {}).get("completion_tokens", 0),
-        "first_data_seconds": first_data or 0,
-        "first_token_seconds": first_token or 0,
-        "total_seconds": total,
-    }))
-except Exception as exc:
-    print(json.dumps({"error": str(exc)}))
-    sys.exit(1)
-PYEOF
-}
-
-echo "=== 1. Native Ollama backend (:11435) ==="
-check "GET /api/version" curl -sf -m 5 http://127.0.0.1:11435/api/version
-check "GET /api/ps" curl -sf -m 5 http://127.0.0.1:11435/api/ps
-
-echo "=== 2. Proxy (:11434) transparent endpoints ==="
-check "GET /api/version" curl -sf -m 5 http://127.0.0.1:11434/api/version
-check "GET /api/tags"    curl -sf -m 5 http://127.0.0.1:11434/api/tags
-check "GET /api/ps"      curl -sf -m 5 http://127.0.0.1:11434/api/ps
-PROXY_TAGS="$(curl -sf -m 5 http://127.0.0.1:11434/api/tags)"
-check "proxy sees model ${MODEL}" bash -c "echo '${PROXY_TAGS}' | grep -q '${MODEL}'"
-
-# Keep this endpoint explicit: the former suite only exercised /api/generate,
-# so it could pass while real OpenAI-compatible traffic had no token metrics.
-echo "=== 3. OpenAI-compatible /v1/chat/completions ==="
-# If the proxy was recently recreated (e.g. by the previous run's persistence
-# checks), Prometheus may still hold the pre-restart cumulative value. Wait
-# for a fresh scrape so before/after deltas are meaningful.
-sync_prom_to_proxy ollama_prompt_tokens_total || { echo "  [FAIL] Prometheus did not sync to proxy prompt counter"; FAIL=$((FAIL+1)); }
-sync_prom_to_proxy ollama_generated_tokens_total || { echo "  [FAIL] Prometheus did not sync to proxy generated counter"; FAIL=$((FAIL+1)); }
-OAI_NS_BEFORE_PROMPT="$(prom_model_value ollama_prompt_tokens_total)"; OAI_NS_BEFORE_PROMPT="${OAI_NS_BEFORE_PROMPT:-0}"
-OAI_NS_BEFORE_GEN="$(prom_model_value ollama_generated_tokens_total)"; OAI_NS_BEFORE_GEN="${OAI_NS_BEFORE_GEN:-0}"
-echo "  non-stream before: prompt=${OAI_NS_BEFORE_PROMPT} generated=${OAI_NS_BEFORE_GEN}"
-
-OAI_NS_RESP="$(curl -sf -m 300 http://127.0.0.1:11434/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: NONSTREAM-MONITORING-OK\"}],\"stream\":false,\"temperature\":0,\"seed\":20260903,\"max_tokens\":16}")"
-OAI_NS_USAGE="$(printf '%s' "${OAI_NS_RESP}" | python3 -c 'import json,sys; u=json.load(sys.stdin).get("usage",{}); print(u.get("prompt_tokens",0),u.get("completion_tokens",0))' 2>/dev/null || echo '0 0')"
-read -r OAI_NS_PROMPT OAI_NS_GEN <<< "${OAI_NS_USAGE}"
-OAI_NS_MODEL="$(printf '%s' "${OAI_NS_RESP}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model", ""))' 2>/dev/null || true)"
-echo "  Ollama reported: model=${OAI_NS_MODEL:-?} prompt_tokens=${OAI_NS_PROMPT:-0} completion_tokens=${OAI_NS_GEN:-0}"
-if [[ "${OAI_NS_MODEL}" == "${MODEL}" ]] && [[ "${OAI_NS_PROMPT:-0}" -gt 0 ]] && [[ "${OAI_NS_GEN:-0}" -gt 0 ]]; then
-  echo "  [ OK ] non-streaming response contains OpenAI usage"; PASS=$((PASS+1))
+echo "=== 1. Vector config validation ==="
+if $VECTOR validate /etc/vector/vector.toml >/tmp/kilo/validate.out 2>&1; then
+  check "vector validate collector/vector.toml" true
 else
-  echo "  [FAIL] non-streaming response missing usable OpenAI usage"; FAIL=$((FAIL+1))
-fi
-wait_for_exact_model_delta ollama_prompt_tokens_total "${OAI_NS_BEFORE_PROMPT}" "${OAI_NS_PROMPT:-0}" "non-stream prompt counter delta"
-wait_for_exact_model_delta ollama_generated_tokens_total "${OAI_NS_BEFORE_GEN}" "${OAI_NS_GEN:-0}" "non-stream generated counter delta"
-
-echo "=== 4. Streaming /v1/chat/completions usage baseline + in-flight lifecycle ==="
-STREAM_NATIVE_RESULT="$(run_stream_probe http://127.0.0.1:11435 1)"; STREAM_NATIVE_STATUS=$?
-STREAM_NATIVE_FIELDS="$(printf '%s' "${STREAM_NATIVE_RESULT}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("chunks",0),d.get("usage_events",0),d.get("prompt_tokens",0),d.get("completion_tokens",0),d.get("first_token_seconds",0),d.get("total_seconds",0))' 2>/dev/null || echo '0 0 0 0 0 0')"
-read -r STREAM_NATIVE_CHUNKS STREAM_NATIVE_USAGE_EVENTS STREAM_NATIVE_PROMPT STREAM_NATIVE_GEN STREAM_NATIVE_FIRST STREAM_NATIVE_TOTAL <<< "${STREAM_NATIVE_FIELDS}"
-echo "  native Ollama reported: prompt_tokens=${STREAM_NATIVE_PROMPT:-0} completion_tokens=${STREAM_NATIVE_GEN:-0} chunks=${STREAM_NATIVE_CHUNKS:-0} first_token=${STREAM_NATIVE_FIRST:-0}s total=${STREAM_NATIVE_TOTAL:-0}s"
-if [[ "${STREAM_NATIVE_STATUS}" -eq 0 ]] && [[ "${STREAM_NATIVE_USAGE_EVENTS:-0}" -eq 1 ]] && [[ "${STREAM_NATIVE_PROMPT:-0}" -gt 0 ]] && [[ "${STREAM_NATIVE_GEN:-0}" -gt 0 ]] && [[ "${STREAM_NATIVE_CHUNKS:-0}" -ge 2 ]] && python3 -c "exit(0 if 0 < float('${STREAM_NATIVE_FIRST:-0}') < float('${STREAM_NATIVE_TOTAL:-0}') else 1)" 2>/dev/null; then
-  echo "  [ OK ] native streaming usage response is valid and starts before completion"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] native streaming usage probe failed: ${STREAM_NATIVE_RESULT}"; FAIL=$((FAIL+1))
+  check "vector validate collector/vector.toml" false
+  sed 's/\x1b\[[0-9;]*m//g' /tmp/kilo/validate.out | tail -20
 fi
 
-STREAM_BEFORE_PROMPT="$(prom_model_value ollama_prompt_tokens_total)"; STREAM_BEFORE_PROMPT="${STREAM_BEFORE_PROMPT:-0}"
-STREAM_BEFORE_GEN="$(prom_model_value ollama_generated_tokens_total)"; STREAM_BEFORE_GEN="${STREAM_BEFORE_GEN:-0}"
-# Exact proxy-side values (read from the proxy itself, no Prometheus scrape lag).
-PROXY_BEFORE_PROMPT="$(proxy_metric_sum ollama_prompt_tokens_total)"; PROXY_BEFORE_PROMPT="${PROXY_BEFORE_PROMPT:-0}"
-PROXY_BEFORE_GEN="$(proxy_metric_sum ollama_generated_tokens_total)"; PROXY_BEFORE_GEN="${PROXY_BEFORE_GEN:-0}"
-echo "  proxy before: prompt=${PROXY_BEFORE_PROMPT} generated=${PROXY_BEFORE_GEN}"
-
-echo "  starting streaming request in background and watching ollama_inflight_requests..."
-STREAM_TMP="$(mktemp /tmp/kilo/stream-probe.XXXXXX)"
-run_stream_probe http://127.0.0.1:11434 0 >"${STREAM_TMP}" 2>&1 &
-STREAM_PID=$!
-
-if wait_proxy_inflight 1 180; then
-  echo "  [ OK ] ollama_inflight_requests == 1 while generation is active"; PASS=$((PASS+1))
+echo "=== 2. Parser unit tests (fixtures from real journal output) ==="
+python3 tests/gen_tests.py >/dev/null
+UNIT_OUT="$($VECTOR test /etc/vector/vector.toml /opt/tests/generated_tests.toml 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+UNIT_PASS="$(printf '%s' "${UNIT_OUT}" | grep -c '\.\.\. passed' || true)"
+UNIT_FAIL="$(printf '%s' "${UNIT_OUT}" | grep -c '\.\.\. failed' || true)"
+if [[ "${UNIT_FAIL}" -eq 0 ]] && [[ "${UNIT_PASS}" -gt 0 ]]; then
+  echo "  [ OK ] vector unit tests: ${UNIT_PASS} passed, 0 failed"; PASS=$((PASS+1))
 else
-  echo "  [FAIL] ollama_inflight_requests never reached 1 during the stream"; FAIL=$((FAIL+1))
+  echo "  [FAIL] vector unit tests: ${UNIT_PASS} passed, ${UNIT_FAIL} failed"; FAIL=$((FAIL+1))
+  printf '%s\n' "${UNIT_OUT}" | grep -A12 '\.\.\. failed' | head -40
 fi
 
-# Exact token counters must be unchanged while the request is still in flight:
-# Ollama reports OpenAI-compatible usage only in the terminal usage event.
-PROXY_DURING_PROMPT="$(proxy_metric_sum ollama_prompt_tokens_total)"; PROXY_DURING_PROMPT="${PROXY_DURING_PROMPT:-0}"
-PROXY_DURING_GEN="$(proxy_metric_sum ollama_generated_tokens_total)"; PROXY_DURING_GEN="${PROXY_DURING_GEN:-0}"
-if python3 -c "exit(0 if abs(${PROXY_DURING_PROMPT} - ${PROXY_BEFORE_PROMPT}) < 0.001 and abs(${PROXY_DURING_GEN} - ${PROXY_BEFORE_GEN}) < 0.001 else 1)" 2>/dev/null; then
-  echo "  [ OK ] token counters unchanged while request is in flight (prompt=${PROXY_DURING_PROMPT} generated=${PROXY_DURING_GEN})"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] token counters moved during in-flight request: prompt ${PROXY_BEFORE_PROMPT}->${PROXY_DURING_PROMPT}, generated ${PROXY_BEFORE_GEN}->${PROXY_DURING_GEN}"; FAIL=$((FAIL+1))
-fi
+echo "=== 3. Static hygiene ==="
+check "no reference to port 11435" bash -c "! grep -rn '11435' compose.yaml prometheus/ grafana/ collector/ README.md 2>/dev/null; ! grep -rn '11435' bin/ | grep -v 'bin/test'"
+check "no WSL_HOST_IP machinery" bash -c "! grep -rn 'WSL_HOST_IP' compose.yaml collector/ prometheus/ grafana/ README.md 2>/dev/null; ! grep -rn 'WSL_HOST_IP' bin/ | grep -v 'bin/test'"
+check "no proxy service or directory" bash -c "[[ ! -d proxy ]] && ! grep -q 'ollama-proxy' compose.yaml"
+check "no Docker socket mounted" bash -c "! grep -rn 'docker.sock' compose.yaml"
+check "no privileged containers" bash -c "! grep -qn 'privileged' compose.yaml"
+check "journal mounts are read-only" bash -c "grep -A4 'Host journal' compose.yaml | grep -q '/var/log/journal:/var/log/journal:ro'"
+check "no Loki / OpenTelemetry" bash -c "! grep -rniE 'loki|otel|opentelemetry' compose.yaml prometheus/ collector/ 2>/dev/null"
+check "no prompt/response capture in collector" bash -c "! grep -rniE 'prompt_text|response_text|\.content|body' collector/vector.toml"
 
-wait "${STREAM_PID}"; STREAM_PROXY_STATUS=$?
-STREAM_PROXY_RESULT="$(cat "${STREAM_TMP}")"; rm -f "${STREAM_TMP}"
-STREAM_PROXY_FIELDS="$(printf '%s' "${STREAM_PROXY_RESULT}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("chunks",0),d.get("usage_events",0),d.get("first_token_seconds",0),d.get("total_seconds",0))' 2>/dev/null || echo '0 0 0 0')"
-read -r STREAM_PROXY_CHUNKS STREAM_PROXY_USAGE_EVENTS STREAM_PROXY_FIRST STREAM_PROXY_TOTAL <<< "${STREAM_PROXY_FIELDS}"
-echo "  proxy stream: chunks=${STREAM_PROXY_CHUNKS:-0} usage_events_visible=${STREAM_PROXY_USAGE_EVENTS:-0} first_token=${STREAM_PROXY_FIRST:-0}s total=${STREAM_PROXY_TOTAL:-0}s"
-if [[ "${STREAM_PROXY_STATUS}" -eq 0 ]] && [[ "${STREAM_PROXY_CHUNKS:-0}" -ge 2 ]] && [[ "${STREAM_PROXY_USAGE_EVENTS:-0}" -eq 0 ]] && python3 -c "exit(0 if 0 < float('${STREAM_PROXY_FIRST:-0}') < float('${STREAM_PROXY_TOTAL:-0}') else 1)" 2>/dev/null; then
-  echo "  [ OK ] proxy stream stayed SSE, forwarded early chunks, and hid only injected usage"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] proxy streaming probe failed: ${STREAM_PROXY_RESULT}"; FAIL=$((FAIL+1))
-fi
-
-# After completion the proxy must have added exactly the reported usage...
-PROXY_AFTER_PROMPT="$(proxy_metric_sum ollama_prompt_tokens_total)"; PROXY_AFTER_PROMPT="${PROXY_AFTER_PROMPT:-0}"
-PROXY_AFTER_GEN="$(proxy_metric_sum ollama_generated_tokens_total)"; PROXY_AFTER_GEN="${PROXY_AFTER_GEN:-0}"
-PROXY_DELTA_PROMPT="$(python3 -c "print(${PROXY_AFTER_PROMPT} - ${PROXY_BEFORE_PROMPT})" 2>/dev/null || echo -999)"
-PROXY_DELTA_GEN="$(python3 -c "print(${PROXY_AFTER_GEN} - ${PROXY_BEFORE_GEN})" 2>/dev/null || echo -999)"
-if python3 -c "exit(0 if abs(${PROXY_DELTA_PROMPT} - ${STREAM_NATIVE_PROMPT:-0}) < 0.001 and abs(${PROXY_DELTA_GEN} - ${STREAM_NATIVE_GEN:-0}) < 0.001 else 1)" 2>/dev/null; then
-  echo "  [ OK ] counters increased at completion by exactly the reported usage (+${PROXY_DELTA_PROMPT} prompt, +${PROXY_DELTA_GEN} generated)"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] post-completion proxy deltas prompt=${PROXY_DELTA_PROMPT} generated=${PROXY_DELTA_GEN}, want ${STREAM_NATIVE_PROMPT:-0}/${STREAM_NATIVE_GEN:-0}"; FAIL=$((FAIL+1))
-fi
-if wait_proxy_inflight 0 15; then
-  echo "  [ OK ] ollama_inflight_requests back to 0 after completion"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] ollama_inflight_requests did not return to 0 after completion"; FAIL=$((FAIL+1))
-fi
-wait_for_exact_model_delta ollama_prompt_tokens_total "${STREAM_BEFORE_PROMPT}" "${STREAM_NATIVE_PROMPT:-0}" "stream prompt counter delta"
-wait_for_exact_model_delta ollama_generated_tokens_total "${STREAM_BEFORE_GEN}" "${STREAM_NATIVE_GEN:-0}" "stream generated counter delta"
-
-echo "=== 4b. Kilo-like streaming workload (system + tools, in-flight + GPU + counters) ==="
-# Representative of Kilo Code traffic: streaming chat completions with a
-# system prompt, a tool definition, and reasoning output. Synthetic coverage
-# cannot prove Kilo semantics end to end (see README); it validates the same
-# proxy path that real Kilo traffic uses.
-KILO_PROM_BEFORE_PROMPT="$(prom_model_value ollama_prompt_tokens_total)"; KILO_PROM_BEFORE_PROMPT="${KILO_PROM_BEFORE_PROMPT:-0}"
-KILO_PROM_BEFORE_GEN="$(prom_model_value ollama_generated_tokens_total)"; KILO_PROM_BEFORE_GEN="${KILO_PROM_BEFORE_GEN:-0}"
-KILO_DIRECT_IDLE="$(gpu_direct_sample)"; KILO_DIRECT_IDLE_UTIL="${KILO_DIRECT_IDLE%%,*}"; KILO_DIRECT_IDLE_PWR="${KILO_DIRECT_IDLE##*,}"
-PROXY_KILO_BEFORE_PROMPT="$(proxy_metric_sum ollama_prompt_tokens_total)"; PROXY_KILO_BEFORE_PROMPT="${PROXY_KILO_BEFORE_PROMPT:-0}"
-PROXY_KILO_BEFORE_GEN="$(proxy_metric_sum ollama_generated_tokens_total)"; PROXY_KILO_BEFORE_GEN="${PROXY_KILO_BEFORE_GEN:-0}"
-
-KILO_TMP="$(mktemp /tmp/kilo/kilo-probe.XXXXXX)"
-run_stream_probe http://127.0.0.1:11434 1 1 >"${KILO_TMP}" 2>&1 &
-KILO_PID=$!
-
-if wait_proxy_inflight 1 180; then
-  echo "  [ OK ] in-flight gauge active immediately for the Kilo-like request"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] in-flight gauge never activated for the Kilo-like request"; FAIL=$((FAIL+1))
-fi
-# Sample nvidia-smi directly while the request is in flight: a short Kilo-like
-# request can complete between two 10s exporter scrapes, which would make a
-# Prometheus-based check miss the load entirely.
-KILO_GPU_UTIL="0"; KILO_GPU_PWR="0"
-for _ in $(seq 1 60); do
-  if ! wait_proxy_inflight 1 1; then
-    break
-  fi
-  SAMPLE="$(gpu_direct_sample)"
-  U="${SAMPLE%%,*}"; P="${SAMPLE##*,}"
-  KILO_GPU_UTIL="$(python3 -c "print(max(float('${KILO_GPU_UTIL}'), float('${U:-0}')))" 2>/dev/null || echo "${KILO_GPU_UTIL}")"
-  KILO_GPU_PWR="$(python3 -c "print(max(float('${KILO_GPU_PWR}'), float('${P:-0}')))" 2>/dev/null || echo "${KILO_GPU_PWR}")"
+LIVE=0; SECURITY=0; RESTART=0
+for arg in "$@"; do
+  case "$arg" in
+    --live) LIVE=1 ;;
+    --security) SECURITY=1 ;;
+    --restart) RESTART=1 ;;
+  esac
 done
-if python3 -c "exit(0 if ${KILO_GPU_UTIL:-0} > 40 or ${KILO_GPU_PWR:-0} > float('${KILO_DIRECT_IDLE_PWR:-0}') + 30 else 1)" 2>/dev/null; then
-  echo "  [ OK ] GPU reacted during the in-flight request (util=${KILO_GPU_UTIL}%, power=${KILO_GPU_PWR} W vs idle ${KILO_DIRECT_IDLE_UTIL:-?}%/${KILO_DIRECT_IDLE_PWR:-?} W)"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] GPU did not react during the Kilo-like request (util=${KILO_GPU_UTIL}%, power=${KILO_GPU_PWR} W vs idle ${KILO_DIRECT_IDLE_UTIL:-?}%/${KILO_DIRECT_IDLE_PWR:-?} W)"; FAIL=$((FAIL+1))
+
+if [[ ${LIVE} -eq 1 ]]; then
+  echo; echo "=== 4. Live validation (real request through native Ollama) ==="
+  OLLAMA_PORT="${OLLAMA_PORT:-11434}" bash tests/test_live.sh || FAIL=$((FAIL+1))
 fi
 
-wait "${KILO_PID}"; KILO_STATUS=$?
-KILO_RESULT="$(cat "${KILO_TMP}")"; rm -f "${KILO_TMP}"
-KILO_FIELDS="$(printf '%s' "${KILO_RESULT}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("prompt_tokens",0),d.get("completion_tokens",0),d.get("chunks",0))' 2>/dev/null || echo '0 0 0')"
-read -r KILO_PROMPT KILO_GEN KILO_CHUNKS <<< "${KILO_FIELDS}"
-echo "  Kilo-like request reported: prompt_tokens=${KILO_PROMPT:-0} completion_tokens=${KILO_GEN:-0} chunks=${KILO_CHUNKS:-0}"
-if [[ "${KILO_STATUS}" -eq 0 ]] && [[ "${KILO_PROMPT:-0}" -gt 0 ]] && [[ "${KILO_CHUNKS:-0}" -ge 2 ]]; then
-  echo "  [ OK ] Kilo-like streaming request completed with usage"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] Kilo-like streaming probe failed: ${KILO_RESULT}"; FAIL=$((FAIL+1))
+if [[ ${SECURITY} -eq 1 ]]; then
+  echo; echo "=== 5. Security / privacy ==="
+  bash tests/test_security.sh || FAIL=$((FAIL+1))
 fi
 
-PROXY_KILO_AFTER_PROMPT="$(proxy_metric_sum ollama_prompt_tokens_total)"; PROXY_KILO_AFTER_PROMPT="${PROXY_KILO_AFTER_PROMPT:-0}"
-PROXY_KILO_AFTER_GEN="$(proxy_metric_sum ollama_generated_tokens_total)"; PROXY_KILO_AFTER_GEN="${PROXY_KILO_AFTER_GEN:-0}"
-if python3 -c "exit(0 if abs((${PROXY_KILO_AFTER_PROMPT} - ${PROXY_KILO_BEFORE_PROMPT}) - ${KILO_PROMPT:-0}) < 0.001 and abs((${PROXY_KILO_AFTER_GEN} - ${PROXY_KILO_BEFORE_GEN}) - ${KILO_GEN:-0}) < 0.001 else 1)" 2>/dev/null; then
-  echo "  [ OK ] counters updated at completion (+${KILO_PROMPT:-0} prompt, +${KILO_GEN:-0} generated)"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] Kilo-like counter deltas prompt=$(python3 -c "print(${PROXY_KILO_AFTER_PROMPT} - ${PROXY_KILO_BEFORE_PROMPT})") generated=$(python3 -c "print(${PROXY_KILO_AFTER_GEN} - ${PROXY_KILO_BEFORE_GEN})"), want ${KILO_PROMPT:-0}/${KILO_GEN:-0}"; FAIL=$((FAIL+1))
-fi
-if wait_proxy_inflight 0 15; then
-  echo "  [ OK ] in-flight gauge back to 0 after the Kilo-like request"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] in-flight gauge stuck after the Kilo-like request"; FAIL=$((FAIL+1))
-fi
-# Converge Prometheus's scrape before later sections take their own deltas.
-wait_for_exact_model_delta ollama_prompt_tokens_total "${KILO_PROM_BEFORE_PROMPT}" "${KILO_PROMPT:-0}" "Kilo-like prompt counter delta"
-wait_for_exact_model_delta ollama_generated_tokens_total "${KILO_PROM_BEFORE_GEN}" "${KILO_GEN:-0}" "Kilo-like generated counter delta"
-
-echo "=== 5. Native /api/generate regression ==="
-NATIVE_BEFORE_PROMPT="$(prom_model_value ollama_prompt_tokens_total)"; NATIVE_BEFORE_PROMPT="${NATIVE_BEFORE_PROMPT:-0}"
-NATIVE_BEFORE_GEN="$(prom_model_value ollama_generated_tokens_total)"; NATIVE_BEFORE_GEN="${NATIVE_BEFORE_GEN:-0}"
-NATIVE_RESP="$(curl -sf -m 300 http://127.0.0.1:11434/api/generate \
-  -H 'Content-Type: application/json' \
-  -d "{\"model\":\"${MODEL}\",\"prompt\":\"Reply with exactly: NATIVE-MONITORING-OK\",\"stream\":false,\"options\":{\"num_predict\":40}}")"
-NATIVE_USAGE="$(printf '%s' "${NATIVE_RESP}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("prompt_eval_count",0),d.get("eval_count",0))' 2>/dev/null || echo '0 0')"
-read -r NATIVE_PROMPT NATIVE_GEN <<< "${NATIVE_USAGE}"
-NATIVE_TEXT="$(printf '%s' "${NATIVE_RESP}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("response","")[:80])' 2>/dev/null || echo '?')"
-echo "  Ollama reported: prompt_eval_count=${NATIVE_PROMPT:-0} eval_count=${NATIVE_GEN:-0}"
-echo "  model said: ${NATIVE_TEXT}"
-if [[ "${NATIVE_PROMPT:-0}" -gt 0 ]] && [[ "${NATIVE_GEN:-0}" -gt 0 ]]; then
-  echo "  [ OK ] native response contains token counts"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] native response missing token counts"; FAIL=$((FAIL+1))
-fi
-wait_for_exact_model_delta ollama_prompt_tokens_total "${NATIVE_BEFORE_PROMPT}" "${NATIVE_PROMPT:-0}" "native prompt counter delta"
-wait_for_exact_model_delta ollama_generated_tokens_total "${NATIVE_BEFORE_GEN}" "${NATIVE_GEN:-0}" "native generated counter delta"
-
-echo "=== 6. Prometheus ==="
-UP_OLLAMA="$(prom_query 'up{job="ollama"}')"
-UP_GPU="$(prom_query 'up{job="nvidia-gpu"}')"
-check 'up{job="ollama"} == 1' bash -c "[[ '${UP_OLLAMA:-}' == '1' ]]"
-check 'up{job="nvidia-gpu"} == 1' bash -c "[[ '${UP_GPU:-}' == '1' ]]"
-check "ollama_prompt_tokens_total present" bash -c "[[ -n \"$(prom_query 'count(ollama_prompt_tokens_total) >= 0')\" ]]"
-check "ollama_generated_tokens_total present" bash -c "[[ -n \"$(prom_query 'count(ollama_generated_tokens_total) >= 0')\" ]]"
-check "ollama_request_duration_seconds present" bash -c "[[ -n \"$(prom_query 'count(ollama_request_duration_seconds_count) >= 0')\" ]]"
-check "ollama_model_loaded present" bash -c "[[ -n \"$(prom_query 'count(ollama_model_loaded) >= 0')\" ]]"
-check "ollama_inflight_requests present" bash -c "[[ -n \"$(prom_query 'count(ollama_inflight_requests) >= 0')\" ]]"
-INFLIGHT_PROM="$(prom_value_sum 'sum(ollama_inflight_requests) or vector(0)')"; INFLIGHT_PROM="${INFLIGHT_PROM:-0}"
-check "ollama_inflight_requests readable and non-negative" python3 -c "exit(0 if float('${INFLIGHT_PROM}') >= 0 else 1)"
-PROM_OAI_PROMPT="$(prom_model_value ollama_prompt_tokens_total)"; PROM_OAI_PROMPT="${PROM_OAI_PROMPT:-0}"
-PROM_OAI_GEN="$(prom_model_value ollama_generated_tokens_total)"; PROM_OAI_GEN="${PROM_OAI_GEN:-0}"
-PROM_OAI_REQUESTS="$(prom_value_sum "sum(ollama_request_duration_seconds_count{endpoint=\"/v1/chat/completions\",model=\"${MODEL}\"})")"; PROM_OAI_REQUESTS="${PROM_OAI_REQUESTS:-0}"
-echo "  real model OpenAI series: prompt=${PROM_OAI_PROMPT} generated=${PROM_OAI_GEN} requests=${PROM_OAI_REQUESTS}"
-check "OpenAI prompt counter non-zero for ${MODEL}" python3 -c "exit(0 if float('${PROM_OAI_PROMPT}') > 0 else 1)"
-check "OpenAI generated counter non-zero for ${MODEL}" python3 -c "exit(0 if float('${PROM_OAI_GEN}') > 0 else 1)"
-check "OpenAI request count non-zero for ${MODEL}" python3 -c "exit(0 if float('${PROM_OAI_REQUESTS}') > 0 else 1)"
-check "OpenAI request duration label present" python3 -c "exit(0 if float('${PROM_OAI_REQUESTS}') > 0 else 1)"
-check "nvidia utilization metric present" bash -c "[[ -n \"$(prom_query 'count(nvidia_smi_utilization_gpu_ratio) >= 0')\" ]]"
-check "nvidia memory metric present" bash -c "[[ -n \"$(prom_query 'count(nvidia_smi_memory_used_bytes) >= 0')\" ]]"
-check "nvidia power metric present" bash -c "[[ -n \"$(prom_query 'count(nvidia_smi_power_draw_watts) >= 0')\" ]]"
-check "nvidia temperature metric present" bash -c "[[ -n \"$(prom_query 'count(nvidia_smi_temperature_gpu) >= 0')\" ]]"
-
-echo "=== 7. Grafana ==="
-GRAFANA_USER="$(grep '^GRAFANA_ADMIN_USER=' .env 2>/dev/null | cut -d= -f2- || echo admin)"
-GRAFANA_PASS="$(grep '^GRAFANA_ADMIN_PASSWORD=' .env 2>/dev/null | cut -d= -f2- || echo ollama)"
-GRAFANA_USER="${GRAFANA_USER:-admin}"; GRAFANA_PASS="${GRAFANA_PASS:-ollama}"
-AUTH="${GRAFANA_USER}:${GRAFANA_PASS}"
-check "Grafana /api/health" curl -sf -m 5 http://127.0.0.1:3000/api/health
-check "datasource health (prometheus)" curl -sf -m 10 -u "${AUTH}" http://127.0.0.1:3000/api/datasources/uid/prometheus/health
-check "dashboard ollama-main provisioned" bash -c "curl -sf -m 5 -u '${AUTH}' http://127.0.0.1:3000/api/dashboards/uid/ollama-main | grep -q '\"title\"'"
-
-REFRESH_VALUE="$(curl -sf -m 5 -u "${AUTH}" http://127.0.0.1:3000/api/dashboards/uid/ollama-main | python3 -c 'import json,sys; print(json.load(sys.stdin)["dashboard"].get("refresh",""))' 2>/dev/null)"
-check "dashboard refresh interval provisioned as 5s (got: ${REFRESH_VALUE:-?})" bash -c "[[ '${REFRESH_VALUE}' == '5s' ]]"
-
-# validate every dashboard panel query executes against Prometheus
-QUERY_ERRORS="$(python3 - "$AUTH" <<'PYEOF'
-import json, subprocess, sys, time, urllib.parse
-auth = sys.argv[1]
-dash = json.loads(subprocess.run(["curl","-sf","-m","5","-u",auth,
-    "http://127.0.0.1:3000/api/dashboards/uid/ollama-main"],capture_output=True,text=True).stdout)
-exprs=[]
-for p in dash["dashboard"]["panels"]:
-    for t in p.get("targets",[]):
-        e=t.get("expr","")
-        e=(e.replace("$__range_s","3600").replace("$__range","3600")
-            .replace("$__rate_interval","5m").replace("$__interval","5m"))
-        if e: exprs.append((p.get("id"),e))
-bad=[]
-for pid,e in exprs:
-    q=urllib.parse.urlencode({"query":e,"time":str(int(time.time()))})
-    out=subprocess.run(["curl","-s","-m","10","-u",auth,
-        f"http://127.0.0.1:3000/api/datasources/uid/prometheus/resources/api/v1/query?{q}"],
-        capture_output=True,text=True).stdout or "{}"
-    r=json.loads(out)
-    if r.get("status")!="success": bad.append((pid,e,r.get("error","no response")))
-print("NONE" if not bad else json.dumps(bad))
-PYEOF
-)"
-if [[ "${QUERY_ERRORS}" == "NONE" ]]; then
-  echo "  [ OK ] all dashboard panel queries parse & execute"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] dashboard queries with errors: ${QUERY_ERRORS}"; FAIL=$((FAIL+1))
-fi
-
-REQUIRED_PANEL_DATA="$(python3 - "${AUTH}" <<'PYEOF'
-import json, math, subprocess, sys, time, urllib.parse
-auth = sys.argv[1]
-dashboard = subprocess.run(["curl", "-sf", "-m", "5", "-u", auth,
-    "http://127.0.0.1:3000/api/dashboards/uid/ollama-main"], capture_output=True, text=True).stdout
-if not dashboard:
-    print(json.dumps(["dashboard unavailable"]))
-    raise SystemExit
-dash = json.loads(dashboard)
-required = {1, 2, 3, 4, 5, 6, 17, 18, 20}
-zero_ok = {19}  # Inference state panel is legitimately 0 when idle
-bad = []
-for panel in dash["dashboard"]["panels"]:
-    pid = panel.get("id")
-    if pid not in required and pid not in zero_ok:
-        continue
-    target = next((t for t in panel.get("targets", []) if t.get("expr")), None)
-    if target is None:
-        bad.append((pid, "missing target"))
-        continue
-    expr = (target["expr"].replace("$__range_s", "3600").replace("$__range", "3600")
-        .replace("$__rate_interval", "5m").replace("$__interval", "5m"))
-    query = urllib.parse.urlencode({"query": expr, "time": str(int(time.time()))})
-    raw = subprocess.run(["curl", "-s", "-m", "10", "-u", auth,
-        f"http://127.0.0.1:3000/api/datasources/uid/prometheus/resources/api/v1/query?{query}"],
-        capture_output=True, text=True).stdout or "{}"
-    response = json.loads(raw)
-    values = [float(row["value"][1]) for row in response.get("data", {}).get("result", [])]
-    if pid in zero_ok:
-        if response.get("status") != "success" or not values or not any(math.isfinite(v) and v >= 0 for v in values):
-            bad.append((pid, expr, response.get("error", "no value")))
-    elif response.get("status") != "success" or not values or not any(math.isfinite(v) and v > 0 for v in values):
-        bad.append((pid, expr, response.get("error", "no non-zero data")))
-print("NONE" if not bad else json.dumps(bad))
-PYEOF
-)"
-if [[ "${REQUIRED_PANEL_DATA}" == "NONE" ]]; then
-  echo "  [ OK ] token-dependent dashboard panels return non-zero data"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] token-dependent dashboard panels without data: ${REQUIRED_PANEL_DATA}"; FAIL=$((FAIL+1))
-fi
-
-echo "=== 8. GPU under real load ==="
-PWR_BEFORE="$(prom_query 'max(nvidia_smi_power_draw_watts)')"; PWR_BEFORE="${PWR_BEFORE:-0}"
-echo "  idle power ~${PWR_BEFORE} W; running a longer generation to make the load visible to 10s scrapes..."
-curl -sf -m 300 http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' \
-  -d "{\"model\":\"${MODEL}\",\"prompt\":\"Write a detailed 300-word story about a robot learning to paint.\",\"stream\":false,\"options\":{\"num_predict\":600}}" >/dev/null
-GPU_OK=0
-for _ in $(seq 1 10); do
-  sleep 2
-  U="$(prom_query 'max_over_time(nvidia_smi_utilization_gpu_ratio[3m])')"
-  P="$(prom_query 'max_over_time(nvidia_smi_power_draw_watts[3m])')"
-  if python3 -c "exit(0 if (${U:-0} > 0.4 or ${P:-0} > ${PWR_BEFORE} + 30) else 1)" 2>/dev/null; then
-    GPU_OK=1; break
-  fi
-done
-if [[ "${GPU_OK}" -eq 1 ]]; then
-  echo "  [ OK ] GPU metrics respond to load (util max=${U:-?}, power max=${P:-?} W vs idle ${PWR_BEFORE} W)"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] GPU utilization/power did not react to generation"; FAIL=$((FAIL+1))
-fi
-
-echo "=== 9. No hardcoded WSL IP in tracked config ==="
-LEAKS="$(grep -RIlE '172\.[0-9]+\.[0-9]+\.[0-9]+' compose.yaml prometheus/ grafana/ bin/ 2>/dev/null | tr '\n' ' ')"
-if [[ -z "${LEAKS}" ]]; then
-  echo "  [ OK ] no WSL IP in compose/prometheus/grafana/bin"; PASS=$((PASS+1))
-else
-  echo "  [FAIL] hardcoded IP found in: ${LEAKS}"; FAIL=$((FAIL+1))
-fi
-
-if [[ ${SKIP_PERSISTENCE} -eq 0 ]]; then
-  echo "=== 10. Persistence across restart ==="
-  TS="$(date +%s)"
-  T0_PROMPT="$(prom_value_sum 'max(ollama_prompt_tokens_total)')"; T0_PROMPT="${T0_PROMPT:-0}"
-  echo "  captured value prompt=${T0_PROMPT} (will query at this timestamp after restart)"
-  docker compose restart prometheus >/dev/null 2>&1
-  check "prometheus ready after restart (WAL replay done)" bash -c "for i in \$(seq 1 60); do curl -sf -m 2 http://127.0.0.1:9090/-/ready >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1"
-  sleep 2
-  T0_AFTER=""
-  for i in $(seq 1 12); do
-    T0_AFTER="$(curl -sf -m 10 "http://127.0.0.1:9090/api/v1/query" --data-urlencode "query=max(ollama_prompt_tokens_total)" --data-urlencode "time=${TS}" | python3 -c 'import json,sys; print(sum(float(r["value"][1]) for r in json.load(sys.stdin)["data"]["result"]))' 2>/dev/null)"
-    python3 -c "exit(0 if abs(${T0_AFTER:-0} - ${T0_PROMPT}) < 0.001 else 1)" 2>/dev/null && break
-    sleep 5
-  done
-  if python3 -c "exit(0 if abs(${T0_AFTER:-0} - ${T0_PROMPT}) < 0.001 else 1)" 2>/dev/null; then
-    echo "  [ OK ] historical sample preserved across prometheus restart (${T0_AFTER})"; PASS=$((PASS+1))
-  else
-    echo "  [FAIL] historical sample lost after restart (was ${T0_PROMPT}, now ${T0_AFTER})"; FAIL=$((FAIL+1))
-  fi
-
-  echo "=== 11. Container recreation (down + up, data retained) ==="
-  docker compose down --remove-orphans >/dev/null 2>&1
-  docker compose up -d >/dev/null 2>&1
-  check "stack healthy after full recreate" bash -c "for i in \$(seq 1 60); do
-      h=\$(docker compose ps --format '{{.Health}}' 2>/dev/null | grep -c '^healthy$' || true)
-      u=\$(docker compose ps --format '{{.Health}}' 2>/dev/null | grep -c '^unhealthy$' || true)
-      [[ \"\$h\" -ge 2 && \"\$u\" -eq 0 ]] && exit 0; sleep 2; done; exit 1"
-  check "proxy recovered after recreate" curl -sf -m 5 http://127.0.0.1:11434/api/version
-  T1_AFTER=""
-  for i in $(seq 1 12); do
-    T1_AFTER="$(curl -sf -m 10 "http://127.0.0.1:9090/api/v1/query" --data-urlencode "query=max(ollama_prompt_tokens_total)" --data-urlencode "time=${TS}" | python3 -c 'import json,sys; print(sum(float(r["value"][1]) for r in json.load(sys.stdin)["data"]["result"]))' 2>/dev/null)"
-    python3 -c "exit(0 if abs(${T1_AFTER:-0} - ${T0_PROMPT}) < 0.001 else 1)" 2>/dev/null && break
-    sleep 5
-  done
-  if python3 -c "exit(0 if abs(${T1_AFTER:-0} - ${T0_PROMPT}) < 0.001 else 1)" 2>/dev/null; then
-    echo "  [ OK ] historical sample preserved across full recreate"; PASS=$((PASS+1))
-  else
-    echo "  [FAIL] historical sample lost across full recreate"; FAIL=$((FAIL+1))
-  fi
+if [[ ${RESTART} -eq 1 ]]; then
+  echo; echo "=== 6. Collector restart / cursor behavior ==="
+  bash tests/test_restart.sh || FAIL=$((FAIL+1))
 fi
 
 echo

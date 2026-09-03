@@ -1,0 +1,6 @@
+srv        update:  - cache state: 0 prompts, 0.000 MiB (limits: 8192.000 MiB, 163840 tokens, 8589934592 est)
+srv        update:  - cache state: 3 prompts, 7669.352 MiB (limits: 8192.000 MiB, 163840 tokens, 163840 est)
+srv  get_availabl: prompt cache update took 0.01 ms
+srv  get_availabl: prompt cache update took 4232.06 ms
+slot   operator(): id  0 | task 4061 | forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+srv         alloc:  - making room for prompt cache entry, removing oldest entry (size = 1265.015 MiB)

@@ -1,0 +1,4 @@
+time=2026-09-02T20:22:32.267+02:00 level=INFO source=model_list_cache.go:112 msg="model list cache hydration complete" models=4 failures=0 elapsed=4.611723ms
+load: special tokens cache size = 5
+llama_kv_cache: CUDA0 KV buffer size = 5440.00 MiB
+srv load_model: prompt cache is enabled, size limit: 8192 MiB

@@ -1,0 +1,703 @@
+# ##############################################################################
+# Ollama journal metrics collector (Vector).
+#
+# Passive collector: reads the WSL host systemd journal for ollama.service,
+# parses llama.cpp / GIN telemetry lines, exposes Prometheus metrics.
+#
+# PRIVACY: only known operational/timing lines are parsed. Raw log messages are
+# never exported; no metric label carries user content.
+#
+# NOTE: the llama.cpp log format is NOT a stable public API. After a major
+# Ollama upgrade, re-run `./bin/test` and check ollama_journal_* self-metrics.
+# ##############################################################################
+
+data_dir = "/var/lib/vector-data"
+
+# Internal health API (used by the compose healthcheck). Not published.
+[api]
+enabled = true
+address = "0.0.0.0:8686"
+
+# ---------------------------------------------------------------- source
+[sources.ollama_journal]
+type = "journald"
+# Only Ollama's own unit; filtered by journalctl before Vector sees anything.
+include_units = ["ollama.service"]
+# Live telemetry only needs the current boot; keeps first-start replay bounded.
+current_boot_only = true
+
+# ---------------------------------------------------------------- parser
+# Classify each journal line into exactly one event and extract fields.
+# Lines that match nothing become event="other" and are only counted.
+[transforms.parse]
+type = "remap"
+inputs = ["ollama_journal"]
+drop_on_error = true
+reroute_dropped = false
+source = '''
+.raw = string(.message) ?? ""
+.event = "other"
+.slot = ""
+.host_ts = to_unix_timestamp(.timestamp, unit: "seconds") ?? 0
+.matched = 1
+
+# --- live: slot picked up a task -------------------------------------------
+if match(.raw, r'slot\s+launch_slot_:\s*id\s+\d+\s*\|\s*task\s+\d+\s*\|\s*processing task') {
+  m = parse_regex!(.raw, r'slot\s+launch_slot_:\s*id\s+(?P<slot>\d+)\s*\|')
+  .event = "slot_launch"
+  .slot = m.slot
+  .active = 1
+  .phase_prefill = 1
+  .phase_decode = 0
+  .generated = 0
+  .tg = 0.0
+  .tg3 = 0.0
+  .processed = 0
+  .progress = 0.0
+  .tps = 0.0
+  .elapsed = 0.0
+  .total_tokens = 0
+# --- live: submitted prompt size (logical token count, includes cached) -----
+} else if match(.raw, r'new prompt, n_ctx_slot = \d+, n_keep = \d+, task\.n_tokens = \d+') {
+  m = parse_regex!(.raw, r'id\s+(?P<slot>\d+)\s*\|\s*task\s+\d+\s*\|\s*new prompt, n_ctx_slot = \d+, n_keep = \d+, task\.n_tokens = (?P<tokens>\d+)')
+  .event = "new_prompt"
+  .slot = m.slot
+  .total_tokens = to_int(m.tokens) ?? 0
+# --- live: prefill/prompt processing progress -------------------------------
+} else if match(.raw, r'prompt processing, n_tokens =') {
+  m = parse_regex!(.raw, r'id\s+(?P<slot>\d+)\s*\|\s*task\s+\d+\s*\|\s*prompt processing, n_tokens =\s*(?P<n>\d+), progress =\s*(?P<progress>[0-9.]+), t =\s*(?P<t>[0-9.]+) s / (?P<tps>[0-9.]+) tokens per second')
+  .event = "prompt_processing"
+  .slot = m.slot
+  .processed = to_int(m.n) ?? 0
+  .progress = to_float(m.progress) ?? 0.0
+  .elapsed = to_float(m.t) ?? 0.0
+  .tps = to_float(m.tps) ?? 0.0
+  .active = 1
+  .phase_prefill = 1
+  .phase_decode = 0
+# --- live: decode progress ("n_gen" variant; "n_decoded" is the legacy form) -
+} else if match(.raw, r'(n_gen|n_decoded) =\s*\d+, tg =') {
+  m = parse_regex!(.raw, r'id\s+(?P<slot>\d+)\s*\|\s*task\s+\d+\s*\|\s*(?:n_gen|n_decoded) =\s*(?P<n>\d+), tg =\s*(?P<tg>[0-9.]+) t/s, tg_3s =\s*(?P<tg3>[0-9.]+) t/s')
+  .event = "live_decode"
+  .slot = m.slot
+  .generated = to_int(m.n) ?? 0
+  .tg = to_float(m.tg) ?? 0.0
+  .tg3 = to_float(m.tg3) ?? 0.0
+  .active = 1
+  .phase_prefill = 0
+  .phase_decode = 1
+# --- completed: prompt eval (tokens actually evaluated by the engine) -------
+} else if match(.raw, r'prompt eval time =') {
+  m = parse_regex!(.raw, r'id\s+(?P<slot>\d+)\s*\|\s*task\s+\d+\s*\|\s*prompt eval time =\s*(?P<ms>[0-9.]+) ms /\s*(?P<tokens>\d+) tokens \(.* (?P<tps>[0-9.]+) tokens per second\)')
+  .event = "final_prompt_eval"
+  .slot = m.slot
+  .ms = to_float(m.ms) ?? 0.0
+  .sec = .ms / 1000.0
+  .tokens = to_int(m.tokens) ?? 0
+  .tps = to_float(m.tps) ?? 0.0
+  .active = 1
+  .phase_prefill = 0
+# --- completed: decode ------------------------------------------------------
+} else if match(.raw, r'\|\s*eval time =') {
+  m = parse_regex!(.raw, r'id\s+(?P<slot>\d+)\s*\|\s*task\s+\d+\s*\|\s*eval time =\s*(?P<ms>[0-9.]+) ms /\s*(?P<tokens>\d+) tokens \(.* (?P<tps>[0-9.]+) tokens per second\)')
+  .event = "final_eval"
+  .slot = m.slot
+  .ms = to_float(m.ms) ?? 0.0
+  .sec = .ms / 1000.0
+  .tokens = to_int(m.tokens) ?? 0
+  .tps = to_float(m.tps) ?? 0.0
+  .active = 1
+  .phase_decode = 0
+# --- completed: total -------------------------------------------------------
+} else if match(.raw, r'\|\s*total time =') {
+  m = parse_regex!(.raw, r'id\s+(?P<slot>\d+)\s*\|\s*task\s+\d+\s*\|\s*total time =\s*(?P<ms>[0-9.]+) ms /\s*(?P<tokens>\d+) tokens')
+  .event = "final_total"
+  .slot = m.slot
+  .ms = to_float(m.ms) ?? 0.0
+  .sec = .ms / 1000.0
+  .tokens = to_int(m.tokens) ?? 0
+# --- live: slot released (authoritative "slot is free" signal) --------------
+} else if match(.raw, r'slot\s+release:\s*id\s+\d+\s*\|') {
+  m = parse_regex!(.raw, r'slot\s+release:\s*id\s+(?P<slot>\d+)')
+  .event = "slot_release"
+  .slot = m.slot
+  .active = 0
+  .phase_prefill = 0
+  .phase_decode = 0
+  .generated = 0
+  .tg = 0.0
+  .tg3 = 0.0
+  .processed = 0
+  .progress = 0.0
+  .tps = 0.0
+  .elapsed = 0.0
+  .total_tokens = 0
+  .zero = 0
+# --- live: whole server idle (no slot id; safety net for state masking) -----
+} else if match(.raw, r'srv\s+update_slots: all slots are idle') {
+  .event = "slots_idle"
+  .zero = 0
+# --- prompt cache: state ----------------------------------------------------
+} else if match(.raw, r'cache state:\s*\d+ prompts,') {
+  m = parse_regex!(.raw, r'cache state:\s*(?P<entries>\d+) prompts,\s*(?P<mib>[0-9.]+) MiB')
+  .event = "cache_state"
+  .entries = to_int(m.entries) ?? 0
+  .bytes = (to_float(m.mib) ?? 0.0) * 1048576.0
+# --- prompt cache: update cost ----------------------------------------------
+} else if match(.raw, r'prompt cache update took') {
+  m = parse_regex!(.raw, r'prompt cache update took (?P<ms>[0-9.]+) ms')
+  .event = "cache_update"
+  .ms = to_float(m.ms) ?? 0.0
+  .sec = .ms / 1000.0
+# --- prompt cache: forced full reprocessing ---------------------------------
+} else if match(.raw, r'forcing full prompt re-processing') {
+  .event = "cache_full_reprocess"
+  .one = 1
+# --- prompt cache: eviction -------------------------------------------------
+} else if match(.raw, r'removing oldest entry') {
+  .event = "cache_eviction"
+  .one = 1
+# --- HTTP access lines (passive request counts/status/duration) -------------
+} else if match(.raw, r'\[GIN\]') {
+  g = parse_regex!(.raw, r'\[GIN\]\s+\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2}\s*\|\s*(?P<status>\d{3})\s*\|\s*(?P<dur>[0-9.µmns]+)\s*\|\s*[\d.]+\s*\|\s*(?P<method>[A-Z]+)\s+"(?P<path>[^"]*)"')
+  dur = g.dur
+  dur_s = 0.0
+  if match(dur, r'^[0-9.]+$') {
+    dur_s = to_float(g.dur) ?? 0.0
+  } else if match(dur, r'ms$') {
+    dur_s = (to_float(replace(dur, "ms", "")) ?? 0.0) / 1000.0
+  } else if match(dur, r'µs$') {
+    dur_s = (to_float(replace(dur, "µs", "")) ?? 0.0) / 1000000.0
+  } else if match(dur, r'ns$') {
+    dur_s = (to_float(replace(dur, "ns", "")) ?? 0.0) / 1000000000.0
+  } else if match(dur, r'^\d+m[0-9.]+s$') {
+    p = parse_regex!(dur, r'^(?P<mm>\d+)m(?P<ss>[0-9.]+)s$')
+    dur_s = (to_float(p.mm) ?? 0.0) * 60.0 + (to_float(p.ss) ?? 0.0)
+  } else if match(dur, r's$') {
+    dur_s = to_float(replace(dur, "s", "")) ?? 0.0
+  }
+  .event = "gin"
+  .status = g.status
+  .method = g.method
+  .path = replace(g.path, r'\?.*$', "")
+  .dur_s = dur_s
+  .one = 1
+}
+'''
+
+# ---------------------------------------------------------------- routing
+[transforms.events]
+type = "route"
+inputs = ["parse"]
+
+[transforms.events.route]
+slot_state = '.event == "slot_launch" || .event == "slot_release"'
+slots_idle = '.event == "slots_idle"'
+new_prompt = '.event == "new_prompt"'
+prompt_processing = '.event == "prompt_processing"'
+live_decode = '.event == "live_decode"'
+final_prompt_eval = '.event == "final_prompt_eval"'
+final_eval = '.event == "final_eval"'
+final_total = '.event == "final_total"'
+cache_state = '.event == "cache_state"'
+cache_update = '.event == "cache_update"'
+cache_full_reprocess = '.event == "cache_full_reprocess"'
+cache_eviction = '.event == "cache_eviction"'
+gin = '.event == "gin"'
+
+# Every line (matched or not) feeds the self-observability counter.
+[transforms.all_lines]
+type = "filter"
+inputs = ["parse"]
+
+[transforms.all_lines.condition]
+type = "vrl"
+source = 'true'
+
+# ---------------------------------------------------------------- metrics
+# Shared helpers per family: every family also updates
+#   ollama_journal_events_matched_total{event}
+#   ollama_journal_last_event_timestamp_seconds
+
+[transforms.mt_slot_state]
+type = "log_to_metric"
+inputs = ["events.slot_state"]
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "active"
+name = "ollama_slot_active"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "phase_prefill"
+name = "ollama_slot_phase_prefill"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "phase_decode"
+name = "ollama_slot_phase_decode"
+tags = { slot = "{{slot}}" }
+
+# Live gauges: launch resets/initializes them to zero for the new request;
+# release zeroes them so no stale t/s or progress survives into idle.
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "generated"
+name = "ollama_live_generated_tokens"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "tg"
+name = "ollama_live_decode_tokens_per_second"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "tg3"
+name = "ollama_live_decode_tokens_per_second_3s"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "processed"
+name = "ollama_live_prompt_processed_tokens"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "progress"
+name = "ollama_live_prompt_progress_ratio"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "tps"
+name = "ollama_live_prompt_tokens_per_second"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "elapsed"
+name = "ollama_live_prompt_elapsed_seconds"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "total_tokens"
+name = "ollama_live_prompt_total_tokens"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_slot_state.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_slots_idle]
+type = "log_to_metric"
+inputs = ["events.slots_idle"]
+
+[[transforms.mt_slots_idle.metrics]]
+type = "gauge"
+field = "zero"
+name = "ollama_slots_idle"
+
+[[transforms.mt_slots_idle.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_slots_idle.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_new_prompt]
+type = "log_to_metric"
+inputs = ["events.new_prompt"]
+
+[[transforms.mt_new_prompt.metrics]]
+type = "gauge"
+field = "total_tokens"
+name = "ollama_live_prompt_total_tokens"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_new_prompt.metrics]]
+type = "counter"
+field = "total_tokens"
+increment_by_value = true
+name = "ollama_prompt_tokens_submitted_total"
+
+[[transforms.mt_new_prompt.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_new_prompt.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_prompt_processing]
+type = "log_to_metric"
+inputs = ["events.prompt_processing"]
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "gauge"
+field = "processed"
+name = "ollama_live_prompt_processed_tokens"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "gauge"
+field = "progress"
+name = "ollama_live_prompt_progress_ratio"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "gauge"
+field = "tps"
+name = "ollama_live_prompt_tokens_per_second"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "gauge"
+field = "elapsed"
+name = "ollama_live_prompt_elapsed_seconds"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "gauge"
+field = "active"
+name = "ollama_slot_active"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "gauge"
+field = "phase_prefill"
+name = "ollama_slot_phase_prefill"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "gauge"
+field = "phase_decode"
+name = "ollama_slot_phase_decode"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_prompt_processing.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_live_decode]
+type = "log_to_metric"
+inputs = ["events.live_decode"]
+
+[[transforms.mt_live_decode.metrics]]
+type = "gauge"
+field = "generated"
+name = "ollama_live_generated_tokens"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_live_decode.metrics]]
+type = "gauge"
+field = "tg"
+name = "ollama_live_decode_tokens_per_second"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_live_decode.metrics]]
+type = "gauge"
+field = "tg3"
+name = "ollama_live_decode_tokens_per_second_3s"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_live_decode.metrics]]
+type = "gauge"
+field = "active"
+name = "ollama_slot_active"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_live_decode.metrics]]
+type = "gauge"
+field = "phase_prefill"
+name = "ollama_slot_phase_prefill"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_live_decode.metrics]]
+type = "gauge"
+field = "phase_decode"
+name = "ollama_slot_phase_decode"
+tags = { slot = "{{slot}}" }
+
+[[transforms.mt_live_decode.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_live_decode.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_final_prompt_eval]
+type = "log_to_metric"
+inputs = ["events.final_prompt_eval"]
+
+[[transforms.mt_final_prompt_eval.metrics]]
+type = "counter"
+field = "tokens"
+increment_by_value = true
+name = "ollama_prompt_evaluated_tokens_total"
+
+[[transforms.mt_final_prompt_eval.metrics]]
+type = "counter"
+field = "sec"
+increment_by_value = true
+name = "ollama_prompt_eval_seconds_total"
+
+[[transforms.mt_final_prompt_eval.metrics]]
+type = "histogram"
+field = "tps"
+name = "ollama_prompt_eval_tokens_per_second"
+buckets = [10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 1500.0, 2000.0]
+
+
+[[transforms.mt_final_prompt_eval.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_final_prompt_eval.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_final_eval]
+type = "log_to_metric"
+inputs = ["events.final_eval"]
+
+[[transforms.mt_final_eval.metrics]]
+type = "counter"
+field = "tokens"
+increment_by_value = true
+name = "ollama_generated_tokens_total"
+
+[[transforms.mt_final_eval.metrics]]
+type = "counter"
+field = "sec"
+increment_by_value = true
+name = "ollama_decode_seconds_total"
+
+[[transforms.mt_final_eval.metrics]]
+type = "histogram"
+field = "tps"
+name = "ollama_decode_tokens_per_second"
+buckets = [5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0, 200.0, 500.0]
+
+
+[[transforms.mt_final_eval.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_final_eval.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_final_total]
+type = "log_to_metric"
+inputs = ["events.final_total"]
+
+[[transforms.mt_final_total.metrics]]
+type = "counter"
+field = "sec"
+increment_by_value = true
+name = "ollama_compute_seconds_total"
+
+[[transforms.mt_final_total.metrics]]
+type = "counter"
+field = "tokens"
+increment_by_value = true
+name = "ollama_compute_tokens_total"
+
+[[transforms.mt_final_total.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_final_total.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_cache_state]
+type = "log_to_metric"
+inputs = ["events.cache_state"]
+
+[[transforms.mt_cache_state.metrics]]
+type = "gauge"
+field = "entries"
+name = "ollama_prompt_cache_entries"
+
+[[transforms.mt_cache_state.metrics]]
+type = "gauge"
+field = "bytes"
+name = "ollama_prompt_cache_bytes"
+
+[[transforms.mt_cache_state.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_cache_state.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_cache_update]
+type = "log_to_metric"
+inputs = ["events.cache_update"]
+
+[[transforms.mt_cache_update.metrics]]
+type = "histogram"
+field = "sec"
+name = "ollama_prompt_cache_update_duration_seconds"
+buckets = [0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
+
+[[transforms.mt_cache_update.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_cache_update.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_cache_full_reprocess]
+type = "log_to_metric"
+inputs = ["events.cache_full_reprocess"]
+
+[[transforms.mt_cache_full_reprocess.metrics]]
+type = "counter"
+field = "one"
+name = "ollama_prompt_cache_full_reprocess_total"
+
+[[transforms.mt_cache_full_reprocess.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_cache_full_reprocess.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_cache_eviction]
+type = "log_to_metric"
+inputs = ["events.cache_eviction"]
+
+[[transforms.mt_cache_eviction.metrics]]
+type = "counter"
+field = "one"
+name = "ollama_prompt_cache_evictions_total"
+
+[[transforms.mt_cache_eviction.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_cache_eviction.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_gin]
+type = "log_to_metric"
+inputs = ["events.gin"]
+
+[[transforms.mt_gin.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_http_requests_total"
+tags = { method = "{{method}}", path = "{{path}}", status = "{{status}}" }
+
+[[transforms.mt_gin.metrics]]
+type = "histogram"
+field = "dur_s"
+name = "ollama_http_request_duration_seconds"
+buckets = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]
+
+[[transforms.mt_gin.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_events_matched_total"
+tags = { event = "{{event}}" }
+
+[[transforms.mt_gin.metrics]]
+type = "gauge"
+field = "host_ts"
+name = "ollama_journal_last_event_timestamp_seconds"
+
+[transforms.mt_seen]
+type = "log_to_metric"
+inputs = ["all_lines"]
+
+[[transforms.mt_seen.metrics]]
+type = "counter"
+field = "matched"
+name = "ollama_journal_lines_seen_total"
+
+# ---------------------------------------------------------------- export
+[sinks.prometheus]
+type = "prometheus_exporter"
+inputs = [
+  "mt_slot_state",
+  "mt_slots_idle",
+  "mt_new_prompt",
+  "mt_prompt_processing",
+  "mt_live_decode",
+  "mt_final_prompt_eval",
+  "mt_final_eval",
+  "mt_final_total",
+  "mt_cache_state",
+  "mt_cache_update",
+  "mt_cache_full_reprocess",
+  "mt_cache_eviction",
+  "mt_gin",
+  "mt_seen",
+]
+address = "0.0.0.0:9598"
+# Gauge state must be last-write-wins by arrival order, not by event
+# timestamp: several transforms update the same gauge family within the same
+# millisecond, and timestamp-gated writes would freeze the first value.
+suppress_timestamp = true
+# Metrics live for the process lifetime (this sink has no expiration option):
+# the parser zeroes live gauges on slot_release/slots_idle, so no stale values
+# are exported; counters stay monotonic across quiet periods.
