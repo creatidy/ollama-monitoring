@@ -2,5 +2,8 @@
 # Stop the monitoring stack. Keeps all persistent data (./data/).
 # Does NOT use `down -v`; named volumes are not used anyway, data is bind-mounted.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
+# shellcheck source=bin/common.sh
+source bin/common.sh
+resolve_runtime_values 0 || true
 docker compose down --remove-orphans

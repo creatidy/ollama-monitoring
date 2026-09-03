@@ -112,7 +112,10 @@ CASES = [
      'assert_eq!(.dur_s, 8.867819513)', []),
     ("http_requests.log", 2, "gin openai chat completions",
      'assert_eq!(.event, "gin")\nassert_eq!(.path, "/v1/chat/completions")\n'
-     'assert_eq!(.dur_s, 2.344185985)', []),
+      'assert_eq!(.method, "POST")\nassert_eq!(.status, "200")\n'
+      'assert_eq!(.dur_s, 2.344185985)',
+      [("mt_gin", "ollama_http_requests_total",
+        {("method", "POST"), ("path", "/v1/chat/completions"), ("status", "200")})]),
     ("http_requests.log", 3, "gin microseconds duration",
      'assert_eq!(.event, "gin")\nassert_eq!(.path, "/api/tags")\n'
      'assert_eq!(.dur_s, 0.000457156)', []),
@@ -126,7 +129,22 @@ CASES = [
        {("method", "POST"), ("path", "/api/chat"), ("status", "200")})]),
     ("http_requests.log", 6, "gin milliseconds duration and status",
      'assert_eq!(.event, "gin")\nassert_eq!(.status, "500")\n'
-     'assert_eq!(.dur_s, 0.045293)', []),
+      'assert_eq!(.dur_s, 0.045293)', []),
+     ("http_requests.log", 7, "dynamic blob path is normalized",
+      'assert_eq!(.event, "gin")\nassert_eq!(.status, "404")\n'
+      'assert_eq!(.method, "GET")\nassert_eq!(.path, "/api/blobs/:digest")',
+      [("mt_gin", "ollama_http_requests_total",
+        {("method", "GET"), ("path", "/api/blobs/:digest"), ("status", "404")})]),
+     ("http_requests.log", 8, "arbitrary path becomes other",
+      'assert_eq!(.event, "gin")\nassert_eq!(.status, "404")\n'
+      'assert_eq!(.method, "GET")\nassert_eq!(.path, "other")',
+      [("mt_gin", "ollama_http_requests_total",
+        {("method", "GET"), ("path", "other"), ("status", "404")})]),
+     ("http_requests.log", 9, "unknown method becomes other",
+      'assert_eq!(.event, "gin")\nassert_eq!(.method, "OTHER")\n'
+      'assert_eq!(.path, "/api/version")',
+      [("mt_gin", "ollama_http_requests_total",
+        {("method", "OTHER"), ("path", "/api/version"), ("status", "405")})]),
 
     # --- unmatched ---------------------------------------------------------
     ("unmatched.log", 1, "ollama structured log unmatched",

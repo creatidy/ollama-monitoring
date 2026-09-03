@@ -5,7 +5,7 @@
 #  - journal and config mounts are read-only
 #  - no Docker socket, no privileged mode, no host PID namespace
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { echo "  [ OK ] $1"; PASS=$((PASS+1)); }
@@ -20,12 +20,16 @@ MODEL="${MODEL:-${OLLAMA_MODEL:-}}"
 if [[ -z "${MODEL}" ]]; then
   MODEL="$(curl -sf -m 5 "http://127.0.0.1:${PORT}/api/ps" | python3 -c '
 import json,sys
-print(n[0] if n else "")' 2>/dev/null)"
+d = json.load(sys.stdin)
+names = [m.get("name", "") for m in d.get("models", []) if "embed" not in m.get("name", "").lower()]
+print(names[0] if names else "")' 2>/dev/null)"
 fi
 if [[ -z "${MODEL}" ]]; then
   MODEL="$(curl -sf -m 5 "http://127.0.0.1:${PORT}/api/tags" | python3 -c '
 import json,sys
-print(n[0] if n else "")' 2>/dev/null)"
+d = json.load(sys.stdin)
+names = [m.get("name", "") for m in d.get("models", []) if "embed" not in m.get("name", "").lower()]
+print(names[0] if names else "")' 2>/dev/null)"
 fi
 if [[ -n "${MODEL}" ]]; then
   curl -sf -m 120 "http://127.0.0.1:${PORT}/api/generate" -H 'Content-Type: application/json' \
@@ -33,6 +37,12 @@ if [[ -n "${MODEL}" ]]; then
 else
   echo "  [WARN] no non-embedding model available; leak check uses current exporter state"
 fi
+
+echo "=== Security: arbitrary HTTP paths are bounded ==="
+PATH_MARKER="PRIVATE-MARKER-DO-NOT-EXPORT-$(date +%s)"
+BLOB_DIGEST="sha256:0123456789abcdef0123456789abcdef"
+curl -sS -m 5 "http://127.0.0.1:${PORT}/${PATH_MARKER}" >/dev/null 2>&1 || true
+curl -sS -m 5 "http://127.0.0.1:${PORT}/api/blobs/${BLOB_DIGEST}" >/dev/null 2>&1 || true
 sleep 2
 METRICS="$(curl -sf -m 5 http://127.0.0.1:9598/metrics 2>/dev/null)"
 if [[ -n "${METRICS}" ]] && ! printf '%s' "${METRICS}" | grep -q "${MARKER}"; then
@@ -47,9 +57,29 @@ if [[ -n "${METRICS}" ]] && ! printf '%s' "${METRICS}" | grep -qiE 'repeat this 
 else
   fail "prompt text found in /metrics"
 fi
+if [[ -n "${METRICS}" ]] && ! printf '%s' "${METRICS}" | grep -Fq "${PATH_MARKER}" && ! printf '%s' "${METRICS}" | grep -Fq "${BLOB_DIGEST}"; then
+  ok "arbitrary path and blob digest are absent from /metrics"
+elif [[ -z "${METRICS}" ]]; then
+  fail "collector /metrics unavailable for path normalization check"
+else
+  fail "arbitrary path or blob digest leaked into /metrics"
+fi
+if [[ -n "${METRICS}" ]] && printf '%s' "${METRICS}" | grep -q 'ollama_journal_events_matched_total{event="gin"}'; then
+  if printf '%s' "${METRICS}" | grep -q 'path="other"'; then
+    ok "arbitrary HTTP path normalized to other"
+  else
+    fail "arbitrary HTTP path was not classified as other"
+  fi
+  if printf '%s' "${METRICS}" | grep -q 'path="/api/blobs/:digest"'; then
+    ok "blob digest path normalized to /api/blobs/:digest"
+  else
+    fail "blob digest path was not normalized"
+  fi
+else
+  echo "  [WARN] GIN metrics unavailable; fixture tests still cover path normalization"
+fi
 
 echo "=== Security: container isolation ==="
-INSPECT="$(docker compose -f compose.yaml config --format json 2>/dev/null || docker compose config 2>/dev/null)"
 CHECKS="$(docker inspect ollama-journal-metrics --format '{{json .HostConfig}} {{json .Mounts}}' 2>/dev/null)"
 if printf '%s' "${CHECKS}" | grep -q '"Privileged":false'; then
   ok "collector not privileged"

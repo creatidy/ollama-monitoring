@@ -8,7 +8,7 @@
 #   - completed counters move by exactly the engine-reported final timings
 #   - final journal-derived counts match the native API usage fields
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PORT="${OLLAMA_PORT:-11434}"
 MODEL="${OLLAMA_MODEL:-$(curl -sf -m 5 "http://127.0.0.1:${PORT}/api/ps" | python3 -c '
@@ -82,8 +82,8 @@ BEFORE_DECODE_COUNT="$(coll_value 'ollama_decode_tokens_per_second_count')"; BEF
 
 # Stream a request with a moderately long answer; while it runs, sample the
 # live metrics (phase + tg_3s) at collector level (no scrape lag).
-PROMPT="Count from 1 to 30, then briefly explain why testing monitoring systems matters."
-RESULT="$(mktemp /tmp/kilo/live-XXXXXX)"
+mkdir -p /tmp/ollama-monitoring
+RESULT="$(mktemp /tmp/ollama-monitoring/live-XXXXXX)"
 python3 - "${BASE}" "${MODEL}" >"${RESULT}" 2>&1 <<'PYEOF' &
 import json, sys, time, urllib.request
 base, model = sys.argv[1], sys.argv[2]
@@ -208,7 +208,7 @@ else
 fi
 
 # Final journal timings (source of truth) read straight from the journal.
-JOURNAL_FINAL="$(journalctl -u ollama --since '-3 min' --no-pager 2>/dev/null | grep -E 'print_timing' | tail -4)"
+JOURNAL_FINAL="$(journalctl -u ollama --since '-3 min' --no-pager -o cat 2>/dev/null | grep -E 'print_timing' | tail -4)"
 echo "  journal final timings:"
 printf '%s\n' "${JOURNAL_FINAL}" | sed 's/^/    /' | cut -c1-160
 

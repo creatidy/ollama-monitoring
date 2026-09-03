@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    # This workflow is verification for the public GitHub push mirror. The
+    # canonical Forgejo runner/security policy is audited separately.
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck
+
+      - name: Run shell and Python static checks
+        run: |
+          bash -n bin/*.sh bin/* tests/*.sh
+          shellcheck bin/* tests/*.sh
+          python3 -m py_compile tests/*.py
+          git diff --check
+
+      - name: Run offline suite and parser fixtures
+        env:
+          COLLECTOR_UID: "1234"
+          COLLECTOR_GID: "1234"
+          JOURNAL_GID: "2345"
+          JOURNAL_DIR: ${{ github.workspace }}
+          GRAFANA_ADMIN_PASSWORD: ci-only-not-a-password
+        run: ./bin/test
