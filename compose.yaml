@@ -1,0 +1,80 @@
+name: ollama-monitoring
+
+services:
+  ollama-proxy:
+    image: ghcr.io/norskhelsenett/ollama-metrics@sha256:3dd32882666cf0e77272086446b5639c636fb090ac9ea629c11874200c629164
+    container_name: ollama-proxy
+    restart: unless-stopped
+    environment:
+      # Native Ollama runs in WSL (systemd), NOT in Docker. host.docker.internal
+      # does not reach it, so bin/up resolves the current WSL IP into .env.
+      # bin/up rewrites .env when the IP changes; `docker compose up -d` then
+      # recreates this container automatically.
+      OLLAMA_HOST: http://${WSL_HOST_IP}:11435
+    ports:
+      # Published on all interfaces so Docker Desktop also binds it on the
+      # Windows host -> reachable from the trusted LAN (firewall rule required).
+      - "11434:8080"
+
+  nvidia-gpu-exporter:
+    image: utkuozdemir/nvidia_gpu_exporter:1.15.0
+    container_name: ollama-nvidia-exporter
+    restart: unless-stopped
+    # NVIDIA driver + nvidia-smi are injected into the container by the WSL2
+    # GPU passthrough; the exporter scrapes nvidia-smi -q output.
+    gpus: all
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: ollama-prometheus
+    restart: unless-stopped
+    # Runs as root because the ./data bind mounts are owned by the WSL user
+    # (no passwordless sudo on this box to chown to uid 65534). Acceptable for
+    # a localhost-only personal stack; see README "Security notes".
+    user: "0"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=90d
+    volumes:
+      # Mount whole config directory (never a single mutable file: Docker
+      # Desktop keeps stale bind mounts when a file's inode is replaced).
+      - ./prometheus:/etc/prometheus:ro
+      - ./data/prometheus:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      # /-/ready only turns 200 once startup (incl. TSDB WAL replay) finished;
+      # /-/healthy answers earlier and would let Grafana query mid-replay.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  grafana:
+    image: grafana/grafana:13.0.8
+    container_name: ollama-grafana
+    restart: unless-stopped
+    # Same root-user rationale as prometheus (WSL bind mount ownership).
+    user: "0"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-ollama}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ollama.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./data/grafana:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s

@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Ollama metrics proxy. Short interval keeps the counter-reset masking
+  # window (proxy restart + immediate traffic before next scrape) small.
+  - job_name: ollama
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["ollama-proxy:8080"]
+
+  # NVIDIA GPU (RTX 3090) via nvidia-smi passthrough.
+  - job_name: nvidia-gpu
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["nvidia-gpu-exporter:9835"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

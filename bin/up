@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Start the monitoring stack. Resolves the current WSL IP so the proxy can
+# reach native Ollama on :11435, writes it to .env, then brings up compose.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "ERROR: docker not found" >&2
+  exit 1
+fi
+
+WSL_HOST_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+if [[ -z "${WSL_HOST_IP}" ]]; then
+  echo "ERROR: could not determine WSL IP address" >&2
+  exit 1
+fi
+
+# Create or refresh .env (preserves user-edited Grafana credentials).
+if [[ ! -f .env ]]; then
+  cp .env.example .env
+fi
+if grep -q '^WSL_HOST_IP=' .env; then
+  PREV_IP="$(grep '^WSL_HOST_IP=' .env | cut -d= -f2-)"
+  if [[ "${PREV_IP}" != "${WSL_HOST_IP}" ]]; then
+    echo "WSL IP changed: ${PREV_IP} -> ${WSL_HOST_IP} (recreating proxy)"
+    sed -i "s|^WSL_HOST_IP=.*|WSL_HOST_IP=${WSL_HOST_IP}|" .env
+  fi
+else
+  printf '\nWSL_HOST_IP=%s\n' "${WSL_HOST_IP}" >> .env
+fi
+
+docker compose up -d --remove-orphans
+
+# Wait for readiness via healthchecks (no fixed sleeps where avoidable).
+# Only services that define healthchecks are expected to report healthy;
+# the others (proxy, gpu exporter) have no in-container healthcheck because
+# their images are distroless (no shell/wget).
+echo "Waiting for services to become healthy..."
+for _ in $(seq 1 60); do
+  HEALTHY="$(docker compose ps --format '{{.Health}}' 2>/dev/null | grep -c '^healthy$' || true)"
+  UNHEALTHY="$(docker compose ps --format '{{.Health}}' 2>/dev/null | grep -c '^unhealthy$' || true)"
+  if [[ "${HEALTHY}" -ge 2 && "${UNHEALTHY}" -eq 0 ]]; then
+    echo
+    echo "Stack is up:"
+    docker compose ps --format 'table {{.Name}}\t{{.Service}}\t{{.Status}}'
+    echo
+    echo "  Grafana    : http://localhost:3000  (login: see .env)"
+    echo "  Prometheus : http://localhost:9090"
+    echo "  Ollama API : http://localhost:11434  (proxy -> native Ollama :11435)"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "WARNING: some services did not turn healthy in time:" >&2
+docker compose ps >&2
+docker compose logs --tail 30 >&2
+exit 1

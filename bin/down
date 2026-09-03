@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stop the monitoring stack. Keeps all persistent data (./data/).
+# Does NOT use `down -v`; named volumes are not used anyway, data is bind-mounted.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+docker compose down --remove-orphans

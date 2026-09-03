@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Overview of the monitoring stack: container health, endpoints, WSL IP match,
+# Prometheus scrape targets.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+fail=0
+ok()   { printf '  [ OK ] %s\n' "$1"; }
+warn() { printf '  [WARN] %s\n' "$1"; fail=1; }
+bad()  { printf '  [FAIL] %s\n' "$1"; fail=1; }
+
+echo "=== Containers ==="
+docker compose ps --format 'table {{.Name}}\t{{.Service}}\t{{.Status}}\t{{.Health}}' 2>/dev/null || bad "docker compose ps failed"
+
+echo
+echo "=== WSL IP ==="
+CUR_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+ENV_IP="$(grep '^WSL_HOST_IP=' .env 2>/dev/null | cut -d= -f2-)"
+if [[ -z "${CUR_IP}" ]]; then
+  bad "could not determine current WSL IP"
+elif [[ "${CUR_IP}" == "${ENV_IP}" ]]; then
+  ok "WSL IP ${CUR_IP} matches .env (proxy target current)"
+else
+  warn "WSL IP changed: .env has ${ENV_IP}, current is ${CUR_IP}. Run ./bin/up to fix."
+fi
+
+echo
+echo "=== Endpoints ==="
+if curl -sf -m 3 http://127.0.0.1:11435/api/version >/dev/null; then
+  ok "native Ollama   : http://127.0.0.1:11435 ($(curl -sf -m 3 http://127.0.0.1:11435/api/version))"
+else
+  bad "native Ollama on :11435 not responding"
+fi
+if curl -sf -m 3 http://127.0.0.1:11434/api/version >/dev/null; then
+  ok "ollama proxy    : http://127.0.0.1:11434 ($(curl -sf -m 3 http://127.0.0.1:11434/api/version))"
+else
+  bad "proxy on :11434 not responding"
+fi
+if curl -sf -m 3 http://127.0.0.1:9090/-/healthy >/dev/null; then
+  ok "Prometheus      : http://localhost:9090"
+else
+  bad "Prometheus on :9090 not responding"
+fi
+if curl -sf -m 3 http://127.0.0.1:3000/api/health >/dev/null; then
+  ok "Grafana         : http://localhost:3000 ($(curl -sf -m 3 http://127.0.0.1:3000/api/health | grep -o '"database": *"[^"]*"'))"
+else
+  bad "Grafana on :3000 not responding"
+fi
+
+echo
+echo "=== Prometheus scrape targets ==="
+TARGETS="$(curl -sf -m 5 'http://127.0.0.1:9090/api/v1/targets?state=active' 2>/dev/null)"
+if [[ -z "${TARGETS}" ]]; then
+  bad "cannot reach Prometheus API"
+else
+  echo "${TARGETS}" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+for t in d["data"]["activeTargets"]:
+    status = t["health"]
+    label = f"{t['"'"'labels'"'"'].get('"'"'job'"'"','"'"'?'"'"')} ({t['"'"'scrapeUrl'"'"']})"
+    err = t.get("lastError","")
+    line = f"{status.upper():8s} {label}"
+    if err: line += f"  lastError={err}"
+    print("  [" + (" OK " if status=="up" else "FAIL") + "] " + line)
+' || bad "could not parse targets"
+fi
+
+echo
+if [[ ${fail} -eq 0 ]]; then
+  echo "Status: all good."
+else
+  echo "Status: problems detected (see above). Run ./bin/up to heal."
+fi
+exit ${fail}
