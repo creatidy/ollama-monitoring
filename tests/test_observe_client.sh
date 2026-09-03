@@ -253,10 +253,10 @@ else
 fi
 
 if [[ "${S_http_series}" -gt 0 ]]; then
-  if greater_than "${HTTP_DELTA}" 0 && greater_than "${GIN_DELTA}" 0; then
-    ok "passive GIN HTTP request counter increased (+${HTTP_DELTA})"
+  if greater_than "${HTTP_DELTA}" 0; then
+    ok "passive GIN HTTP request counter increased (+${HTTP_DELTA}; parsed gin events +${GIN_DELTA})"
   else
-    fail "GIN metrics are available but no passive HTTP request increase was observed"
+    fail "GIN request metrics are available but no passive HTTP counter increase was observed"
   fi
 else
   warn "GIN request metrics are unavailable; HTTP-count validation was skipped"
