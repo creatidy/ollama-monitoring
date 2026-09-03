@@ -58,10 +58,9 @@ journal_mounts = [m for m in mounts if m.get("target") == "/var/log/journal"]
 assert len(journal_mounts) == 1
 journal_mount = journal_mounts[0]
 assert journal_mount.get("read_only") is True
-assert journal_mount.get("bind", {}).get("create_host_path") is False
 machine_mounts = [m for m in mounts if m.get("target") == "/etc/machine-id"]
 assert len(machine_mounts) == 1
-assert machine_mounts[0].get("bind", {}).get("create_host_path") is False
+assert machine_mounts[0].get("read_only") is True
 PY
 then
   ok "core has no GPU requirement and journal binds are safe"
@@ -70,6 +69,7 @@ else
 fi
 
 check "Compose does not depend on both host journal paths" bash -c '! grep -qE "(/var/log/journal|/run/log/journal):/" compose.yaml'
+check "journal and machine-id binds disable host path creation" bash -c 'grep -c "create_host_path: false" compose.yaml | grep -qx 2'
 check "Compose has no fixed collector uid/gid assumptions" bash -c '! grep -qE "1000|999" compose.yaml'
 check "example does not ship a reusable Grafana password" bash -c '! grep -q "GRAFANA_ADMIN_PASSWORD=ollama" .env.example'
 check "local Grafana credentials file is ignored" git check-ignore -q .env
