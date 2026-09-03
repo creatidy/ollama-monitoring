@@ -73,6 +73,8 @@ check "journal and machine-id binds disable host path creation" bash -c 'grep -c
 check "Compose has no fixed collector uid/gid assumptions" bash -c '! grep -qE "1000|999" compose.yaml'
 check "example does not ship a reusable Grafana password" bash -c '! grep -q "GRAFANA_ADMIN_PASSWORD=ollama" .env.example'
 check "local Grafana credentials file is ignored" git check-ignore -q .env
+check "GIN endpoint and method labels are normalized" bash -c "grep -q 'endpoint = \"other\"' collector/vector.toml && grep -q '/api/blobs/:digest' collector/vector.toml && grep -q 'method = \"OTHER\"' collector/vector.toml"
+check "startup gate includes every core service" bash -c "grep -q 'core_services=(journal-metrics prometheus grafana)' bin/up"
 
 if python3 - <<'PY'
 import json

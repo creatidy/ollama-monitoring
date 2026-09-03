@@ -1,6 +1,8 @@
 # ollama-monitoring
 
-[![CI](https://github.com/creatidy/ollama-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/creatidy/ollama-monitoring/actions/workflows/ci.yml)
+[![GitHub mirror CI](https://github.com/creatidy/ollama-monitoring/actions/workflows/ci.yml/badge.svg)](https://github.com/creatidy/ollama-monitoring/actions/workflows/ci.yml)
+
+> Repository status: [canonical development on Forgejo](https://forgejo.creatidy.com/BioMedical-IT/ollama-monitoring) | [public mirror and issue tracker on GitHub](https://github.com/creatidy/ollama-monitoring)
 
 > **See what Ollama's inference engine is actually doing, live, without putting anything in the request path.**
 
@@ -32,6 +34,8 @@ cd ollama-monitoring
 ./bin/doctor
 ./bin/up
 ```
+
+Canonical alternative: `git clone https://forgejo.creatidy.com/BioMedical-IT/ollama-monitoring.git`
 
 Open Grafana at <http://localhost:3000>. The generated Grafana credentials are
 stored in the ignored `.env`; `./bin/up` creates a random password only when
@@ -110,9 +114,10 @@ name. See the [compatibility matrix](docs/compatibility.md).
 Only known operational, timing, cache, and GIN access-log shapes are parsed.
 Prompt text, responses, tool arguments, raw journal messages, and user content
 are not exported or persisted by the collector. Metric labels contain bounded
-operational values such as slot, endpoint, method, and status. All published
-ports bind to localhost, host journal and machine-id mounts are read-only, and
-the collector has no Docker socket, host PID namespace, or privileged mode.
+operational values such as slot, normalized endpoint, method, and status. All
+published ports bind to localhost; host journal and machine-id mounts are
+read-only; and the collector has no Docker socket, host PID namespace, or
+privileged mode.
 
 Run `./bin/test --security` against the local stack for the live marker and
 container-isolation checks. Review [CONTRIBUTING.md](CONTRIBUTING.md) before

@@ -121,12 +121,22 @@ if ! docker compose up -d --force-recreate --remove-orphans journal-metrics prom
   exit 1
 fi
 
-# Wait for readiness via healthchecks.
+# Wait until every user-facing core service is healthy. The optional NVIDIA
+# exporter has no healthcheck and is intentionally not part of this gate.
 echo "Waiting for services to become healthy..."
+core_services_healthy() {
+  local statuses service
+  local core_services=(journal-metrics prometheus grafana)
+  statuses="$(docker compose ps --format '{{.Service}}\t{{.Health}}' 2>/dev/null || true)"
+  for service in "${core_services[@]}"; do
+    if ! printf '%s\n' "${statuses}" | grep -Eq "^${service}[[:space:]]+healthy$"; then
+      return 1
+    fi
+  done
+  return 0
+}
 for _ in $(seq 1 60); do
-  HEALTHY="$(docker compose ps --format '{{.Health}}' 2>/dev/null | grep -c '^healthy$' || true)"
-  UNHEALTHY="$(docker compose ps --format '{{.Health}}' 2>/dev/null | grep -c '^unhealthy$' || true)"
-  if [[ "${HEALTHY}" -ge 2 && "${UNHEALTHY}" -eq 0 ]]; then
+  if core_services_healthy; then
     echo
     echo "Stack is up:"
     docker compose ps --format 'table {{.Name}}\t{{.Service}}\t{{.Status}}'
@@ -134,13 +144,13 @@ for _ in $(seq 1 60); do
     echo "  Grafana    : http://localhost:3000  (login: see .env)"
     echo "  Prometheus : http://localhost:9090"
     echo "  Collector  : http://localhost:9598/metrics"
-  echo "  Ollama     : native on :${OLLAMA_PORT} (not part of this stack)"
+    echo "  Ollama     : native on :${OLLAMA_PORT} (not part of this stack)"
     exit 0
   fi
   sleep 2
 done
 
-echo "WARNING: some services did not turn healthy in time:" >&2
+echo "WARNING: core services did not all become healthy in time:" >&2
 docker compose ps >&2
 docker compose logs --tail 30 >&2
 echo "Run ./bin/doctor, then inspect docker compose logs." >&2

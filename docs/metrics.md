@@ -43,7 +43,7 @@ only when a request finishes.
 | `ollama_decode_tokens_per_second` | Per-request completed decode-speed histogram. |
 | `ollama_compute_seconds_total` | Completed llama.cpp total time. |
 | `ollama_compute_tokens_total` | Evaluated prompt tokens plus generated tokens. |
-| `ollama_http_requests_total{method,path,status}` | Passive count from Ollama GIN access lines. |
+| `ollama_http_requests_total{method,path,status}` | Passive count from Ollama GIN access lines; `path` is a normalized endpoint label. |
 | `ollama_http_request_duration_seconds` | Passive GIN request-duration histogram. |
 
 Completed counters do not include a request until its final timing lines are
@@ -59,6 +59,21 @@ large logical context while the engine evaluates only the uncached suffix.
 | `ollama_prompt_cache_update_duration_seconds` | Prompt-cache update latency. |
 | `ollama_prompt_cache_full_reprocess_total` | Forced full prompt reprocessing events. |
 | `ollama_prompt_cache_evictions_total` | Oldest-entry eviction events. |
+
+## HTTP Label Bounds
+
+The collector never exports the raw GIN path. Known routes retain their fixed
+path, including `/v1/chat/completions`, `/api/chat`, `/api/generate`,
+`/api/embed`, `/api/embeddings`, `/api/ps`, `/api/tags`, `/api/show`,
+`/api/pull`, `/api/push`, `/api/create`, `/api/delete`, `/api/copy`, and
+`/api/version`. The OpenAI-compatible `/v1/models` and `/v1/embeddings` routes
+are also recognized on the verified server.
+
+The dynamic `/api/blobs/<value>` route becomes `/api/blobs/:digest`; every
+other route becomes `other`. Methods are limited to `GET`, `POST`, `PUT`,
+`PATCH`, `DELETE`, `HEAD`, `OPTIONS`, and `OTHER`. Status remains a three-digit
+status label. This keeps request-path metrics useful without allowing arbitrary
+caller strings or unbounded path cardinality.
 
 ## Collector Health
 

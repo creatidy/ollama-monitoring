@@ -37,6 +37,12 @@ if [[ -n "${MODEL}" ]]; then
 else
   echo "  [WARN] no non-embedding model available; leak check uses current exporter state"
 fi
+
+echo "=== Security: arbitrary HTTP paths are bounded ==="
+PATH_MARKER="PRIVATE-MARKER-DO-NOT-EXPORT-$(date +%s)"
+BLOB_DIGEST="sha256:0123456789abcdef0123456789abcdef"
+curl -sS -m 5 "http://127.0.0.1:${PORT}/${PATH_MARKER}" >/dev/null 2>&1 || true
+curl -sS -m 5 "http://127.0.0.1:${PORT}/api/blobs/${BLOB_DIGEST}" >/dev/null 2>&1 || true
 sleep 2
 METRICS="$(curl -sf -m 5 http://127.0.0.1:9598/metrics 2>/dev/null)"
 if [[ -n "${METRICS}" ]] && ! printf '%s' "${METRICS}" | grep -q "${MARKER}"; then
@@ -50,6 +56,27 @@ if [[ -n "${METRICS}" ]] && ! printf '%s' "${METRICS}" | grep -qiE 'repeat this 
   ok "no prompt text in /metrics"
 else
   fail "prompt text found in /metrics"
+fi
+if [[ -n "${METRICS}" ]] && ! printf '%s' "${METRICS}" | grep -Fq "${PATH_MARKER}" && ! printf '%s' "${METRICS}" | grep -Fq "${BLOB_DIGEST}"; then
+  ok "arbitrary path and blob digest are absent from /metrics"
+elif [[ -z "${METRICS}" ]]; then
+  fail "collector /metrics unavailable for path normalization check"
+else
+  fail "arbitrary path or blob digest leaked into /metrics"
+fi
+if [[ -n "${METRICS}" ]] && printf '%s' "${METRICS}" | grep -q 'ollama_journal_events_matched_total{event="gin"}'; then
+  if printf '%s' "${METRICS}" | grep -q 'path="other"'; then
+    ok "arbitrary HTTP path normalized to other"
+  else
+    fail "arbitrary HTTP path was not classified as other"
+  fi
+  if printf '%s' "${METRICS}" | grep -q 'path="/api/blobs/:digest"'; then
+    ok "blob digest path normalized to /api/blobs/:digest"
+  else
+    fail "blob digest path was not normalized"
+  fi
+else
+  echo "  [WARN] GIN metrics unavailable; fixture tests still cover path normalization"
 fi
 
 echo "=== Security: container isolation ==="

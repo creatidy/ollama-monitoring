@@ -4,6 +4,17 @@ This project is intentionally small and passive. Keep native Ollama on
 `:11434`, do not add an inference proxy, and do not put request content into
 metrics or fixtures.
 
+## Repository Topology
+
+Canonical development, branch history, merges, tags, and releases happen in
+[Forgejo](https://forgejo.creatidy.com/BioMedical-IT/ollama-monitoring). GitHub
+is the [public push mirror](https://github.com/creatidy/ollama-monitoring) and
+its Issues are the easiest public issue-reporting channel. Do not expect a
+change merged only on GitHub to become authoritative history. GitHub pull
+requests may be used as contribution intake; accepted changes will be
+integrated into Forgejo by the maintainer. A public Forgejo account is not
+required to report an issue.
+
 ## Test Locally
 
 Run the offline suite with:

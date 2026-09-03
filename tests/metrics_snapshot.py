@@ -92,6 +92,8 @@ def main() -> int:
     for key, (name, operation) in gauges.items():
         emit("gauge", key, total(name) if operation == "sum" else maximum(name))
 
+    # The collector's path label is already normalized to a finite endpoint
+    # classification; never reconstruct or print a raw request path here.
     http_values = values.get("ollama_http_requests_total", [])
     emit("meta", "http_series", len(http_values))
     emit("metric", "http_total", sum(value for _, value in http_values))

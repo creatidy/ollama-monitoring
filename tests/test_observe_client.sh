@@ -155,6 +155,7 @@ echo "=== Passive external-client acceptance test ==="
 echo "No inference request will be sent by this test."
 echo "${CLIENT_INSTRUCTION}"
 echo "Observation window: ${TIMEOUT}s; traffic is observed through journal-derived metrics."
+echo "Reported HTTP endpoints use the collector's normalized path labels."
 echo "The journal does not expose a trustworthy client identity, so this proves activity during the declared window, not cryptographic client identity."
 
 BEFORE="$(fetch_snapshot || true)"
@@ -331,12 +332,12 @@ if ((${#AFTER_PATHS[@]} > 0)); then
     fi
   done
   if [[ -n "${ENDPOINTS}" ]]; then
-    echo "  endpoint(s) observed: ${ENDPOINTS}"
+    echo "  normalized endpoint(s) observed: ${ENDPOINTS}"
   else
-    echo "  endpoint(s) observed: no path delta reported"
+    echo "  normalized endpoint(s) observed: no path delta reported"
   fi
 else
-  echo "  endpoint(s) observed: no parsed GIN paths"
+  echo "  normalized endpoint(s) observed: no parsed GIN paths"
 fi
 
 echo

@@ -160,6 +160,47 @@ if match(.raw, r'slot\s+launch_slot_:\s*id\s+\d+\s*\|\s*task\s+\d+\s*\|\s*proces
 # --- HTTP access lines (passive request counts/status/duration) -------------
 } else if match(.raw, r'\[GIN\]') {
   g = parse_regex!(.raw, r'\[GIN\]\s+\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2}\s*\|\s*(?P<status>\d{3})\s*\|\s*(?P<dur>[0-9.µmns]+)\s*\|\s*[\d.]+\s*\|\s*(?P<method>[A-Z]+)\s+"(?P<path>[^"]*)"')
+  path = replace(g.path, r'\?.*$', "")
+  endpoint = "other"
+  if path == "/v1/chat/completions" {
+    endpoint = "/v1/chat/completions"
+  } else if path == "/v1/embeddings" {
+    endpoint = "/v1/embeddings"
+  } else if path == "/v1/models" {
+    endpoint = "/v1/models"
+  } else if path == "/api/chat" {
+    endpoint = "/api/chat"
+  } else if path == "/api/generate" {
+    endpoint = "/api/generate"
+  } else if path == "/api/embed" {
+    endpoint = "/api/embed"
+  } else if path == "/api/embeddings" {
+    endpoint = "/api/embeddings"
+  } else if path == "/api/ps" {
+    endpoint = "/api/ps"
+  } else if path == "/api/tags" {
+    endpoint = "/api/tags"
+  } else if path == "/api/show" {
+    endpoint = "/api/show"
+  } else if path == "/api/pull" {
+    endpoint = "/api/pull"
+  } else if path == "/api/push" {
+    endpoint = "/api/push"
+  } else if path == "/api/create" {
+    endpoint = "/api/create"
+  } else if path == "/api/delete" {
+    endpoint = "/api/delete"
+  } else if path == "/api/copy" {
+    endpoint = "/api/copy"
+  } else if path == "/api/version" {
+    endpoint = "/api/version"
+  } else if match(path, r'^/api/blobs/[^/]+$') {
+    endpoint = "/api/blobs/:digest"
+  }
+  method = "OTHER"
+  if g.method == "GET" || g.method == "POST" || g.method == "PUT" || g.method == "PATCH" || g.method == "DELETE" || g.method == "HEAD" || g.method == "OPTIONS" {
+    method = g.method
+  }
   dur = g.dur
   dur_s = 0.0
   if match(dur, r'^[0-9.]+$') {
@@ -178,11 +219,15 @@ if match(.raw, r'slot\s+launch_slot_:\s*id\s+\d+\s*\|\s*task\s+\d+\s*\|\s*proces
   }
   .event = "gin"
   .status = g.status
-  .method = g.method
-  .path = replace(g.path, r'\?.*$', "")
+  .method = method
+  .path = endpoint
   .dur_s = dur_s
   .one = 1
 }
+
+# Raw messages are useful only while classifying the event. Do not carry them
+# into downstream transforms if the topology is extended later.
+del(.raw)
 '''
 
 # ---------------------------------------------------------------- routing
