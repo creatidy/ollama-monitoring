@@ -20,7 +20,7 @@ Login: see `.env` (defaults: `admin` / `ollama`).
 |---|---|
 | `./bin/up` | Start / heal the stack. Resolves the current WSL IP into `.env` and recreates containers whose config changed. Safe to re-run anytime. |
 | `./bin/status` | Health overview: containers, WSL IP match, all four endpoints, Prometheus scrape targets. |
-| `./bin/test` | Full end-to-end validation (28 checks, uses the real model, includes persistence tests). `--skip-persistence` for a quicker run. |
+| `./bin/test` | Full end-to-end validation (including real OpenAI-compatible streaming/non-streaming traffic, native regression, dashboards, GPU, and persistence). `--skip-persistence` for a quicker run. |
 | `./bin/down` | Stop. Keeps all data. Never uses `down -v`. |
 
 ## URLs / ports
@@ -41,7 +41,7 @@ requests sent directly to `:11435` are invisible to token accounting.
 clients / trusted LAN
         |
         v
-:11434  ollama-proxy (ghcr.io/norskhelsenett/ollama-metrics, pinned by digest)
+:11434  ollama-proxy (local build of NorskHelsenett/ollama-metrics)
         |      in-memory Prometheus counters + transparent API forwarding
         v
 :11435  native Ollama 0.33.1 (systemd service in WSL, NOT containerized)
@@ -104,6 +104,33 @@ The 5 s scrape interval on the `ollama` job keeps all these windows small.
 There is no billing-grade exactness here; daily/weekly/monthly answers from
 `increase(metric[24h])` etc. are reliable for personal use.
 
+### OpenAI-compatible chat completions
+
+The local proxy build also parses Ollama's OpenAI-compatible usage shape from
+`/v1/chat/completions`:
+
+- Non-streaming responses use `usage.prompt_tokens` and
+  `usage.completion_tokens`.
+- Streaming requests are forwarded as SSE immediately and the final usage
+  event is parsed.
+- For a streaming request that does not already set
+  `stream_options.include_usage=true`, the proxy adds that option only on the
+  upstream request. Ollama `0.33.1` then reports exact counts in its final
+  usage-only SSE event.
+- The proxy consumes that added usage-only event before forwarding the
+  response, so clients that did not request usage receive the same normal
+  chunks and `data: [DONE]` as before. If the client already requested usage,
+  the event passes through unchanged.
+
+The custom image source is under `./proxy/`. It is based on upstream
+`NorskHelsenett/ollama-metrics` revision
+`02911ce53b5b14cff172163cd5858854dd0148e3`, the source revision recorded by
+the former pinned image
+(`sha256:3dd32882666cf0e77272086446b5639c636fb090ac9ea629c11874200c629164`).
+The upstream OpenAI usage changes are still unmerged, so the endpoint parser
+and streaming handling are maintained as a narrow local patch. `bin/up` builds
+this image through Compose; no manually built image is required.
+
 ## GPU metrics
 
 `nvidia_smi_*` series (utilization ratio, memory used/total bytes, power watts,
@@ -148,14 +175,14 @@ are rough, clearly-labeled estimates — not billing data.
 
 ## Upgrading images
 
-Images are pinned (`prom/prometheus:v3.14.0`, `grafana/grafana:13.0.8`,
-`nvidia_gpu_exporter:1.15.0`, ollama-metrics by digest — it publishes no
-version tags). To upgrade:
+Prometheus, Grafana, and the NVIDIA exporter remain pinned
+(`prom/prometheus:v3.14.0`, `grafana/grafana:13.0.8`,
+`nvidia_gpu_exporter:1.15.0`). The Ollama proxy is built locally from
+`./proxy/` so its parser fix is reproducible. To upgrade:
 
 1. `./bin/down`
-2. Change the tag in `compose.yaml`; for ollama-metrics get the new digest
-   with `docker pull ghcr.io/norskhelsenett/ollama-metrics:latest` and
-   `docker image inspect --format '{{json .RepoDigests}}' ...`.
+2. Update the proxy source/Dockerfile under `proxy/` when intentionally
+   rebasing the local patch onto a newer upstream revision.
 3. `./bin/up && ./bin/test`
 
 Data survives upgrades (it lives in `./data/`). If a new Grafana major version

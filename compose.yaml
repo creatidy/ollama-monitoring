@@ -2,7 +2,10 @@ name: ollama-monitoring
 
 services:
   ollama-proxy:
-    image: ghcr.io/norskhelsenett/ollama-metrics@sha256:3dd32882666cf0e77272086446b5639c636fb090ac9ea629c11874200c629164
+    image: ollama-monitoring/ollama-proxy:local
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
     container_name: ollama-proxy
     restart: unless-stopped
     environment:

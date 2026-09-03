@@ -29,7 +29,7 @@ else
   printf '\nWSL_HOST_IP=%s\n' "${WSL_HOST_IP}" >> .env
 fi
 
-docker compose up -d --remove-orphans
+docker compose up -d --build --remove-orphans
 
 # Wait for readiness via healthchecks (no fixed sleeps where avoidable).
 # Only services that define healthchecks are expected to report healthy;
