@@ -97,6 +97,10 @@ nonzero() {
   greater_than "$1" 0
 }
 
+less_than() {
+  greater_than "$2" "$1"
+}
+
 delta() {
   python3 - "$1" "$2" <<'PY'
 import sys
@@ -105,6 +109,40 @@ try:
 except (ValueError, TypeError):
     print("0")
 PY
+}
+
+# Vector's Prometheus process-lifetime counters can reset if the collector is
+# recreated while an operator is testing. Keep the acceptance window useful by
+# treating the first post-reset snapshot as a new zero baseline rather than
+# reporting negative deltas.
+reset_baseline_if_needed() {
+  if less_than "${S_launch}" "${BEFORE_launch}" ||
+    less_than "${S_release}" "${BEFORE_release}" ||
+    less_than "${S_idle}" "${BEFORE_idle}" ||
+    less_than "${S_new_prompt}" "${BEFORE_new_prompt}" ||
+    less_than "${S_prefill_events}" "${BEFORE_prefill}" ||
+    less_than "${S_decode_events}" "${BEFORE_decode}" ||
+    less_than "${S_final_prompt}" "${BEFORE_final_prompt}" ||
+    less_than "${S_final_eval}" "${BEFORE_final_eval}" ||
+    less_than "${S_final_total}" "${BEFORE_final_total}" ||
+    less_than "${S_gin}" "${BEFORE_gin}" ||
+    less_than "${S_eval_tokens}" "${BEFORE_eval_tokens}" ||
+    less_than "${S_generated_tokens}" "${BEFORE_generated_tokens}" ||
+    less_than "${S_compute_tokens}" "${BEFORE_compute_tokens}" ||
+    less_than "${S_compute_seconds}" "${BEFORE_compute_seconds}" ||
+    less_than "${S_prompt_submitted}" "${BEFORE_prompt_submitted}" ||
+    less_than "${S_decode_sum}" "${BEFORE_decode_sum}" ||
+    less_than "${S_decode_count}" "${BEFORE_decode_count}" ||
+    less_than "${S_http_total}" "${BEFORE_http_total}"; then
+    echo "  observe: collector counters reset; restarting the observation baseline"
+    BEFORE_launch=0; BEFORE_release=0; BEFORE_idle=0; BEFORE_new_prompt=0
+    BEFORE_prefill=0; BEFORE_decode=0; BEFORE_final_prompt=0
+    BEFORE_final_eval=0; BEFORE_final_total=0; BEFORE_gin=0
+    BEFORE_eval_tokens=0; BEFORE_generated_tokens=0; BEFORE_compute_tokens=0
+    BEFORE_compute_seconds=0; BEFORE_prompt_submitted=0; BEFORE_decode_sum=0
+    BEFORE_decode_count=0; BEFORE_http_total=0
+    BEFORE_PATHS=()
+  fi
 }
 
 if [[ "${MODE}" == "kilo" ]]; then
@@ -154,6 +192,7 @@ while [[ "$(date +%s)" -lt "${DEADLINE}" ]]; do
     continue
   fi
   load_snapshot "${SNAPSHOT}" AFTER_PATHS
+  reset_baseline_if_needed
 
   if greater_than "${S_launch}" "${BEFORE_launch}" || greater_than "${S_new_prompt}" "${BEFORE_new_prompt}" || greater_than "${S_decode_events}" "${BEFORE_decode}"; then
     ACTIVITY_SEEN=1
@@ -201,6 +240,7 @@ done
 AFTER="$(fetch_snapshot || true)"
 if [[ -n "${AFTER}" ]]; then
   load_snapshot "${AFTER}" AFTER_PATHS
+  reset_baseline_if_needed
 fi
 
 LAUNCH_DELTA="$(delta "${S_launch}" "${BEFORE_launch}")"
