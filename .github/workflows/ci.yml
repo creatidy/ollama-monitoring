@@ -9,6 +9,9 @@ permissions:
 
 jobs:
   offline:
+    # This workflow is verification for the public GitHub push mirror. The
+    # canonical Forgejo runner/security policy is audited separately.
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
