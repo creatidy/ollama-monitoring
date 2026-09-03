@@ -5,16 +5,19 @@
 #   ./bin/test --live       additionally validates against the RUNNING stack
 #                           and native Ollama (real request, phase lifecycle,
 #                           tg_3s live match, final counts vs API)
-#   ./bin/test --security   security/privacy checks (stack running)
-#   ./bin/test --restart    collector restart/cursor behavior (stack running)
+#   ./bin/test --security       security/privacy checks (stack running)
+#   ./bin/test --restart        collector restart/cursor behavior (stack running)
+#   ./bin/test --observe-client passive external-client acceptance window
+#   ./bin/test --kilo            same observer with Kilo-specific instructions
 #
 # --live requires native Ollama on :11434 (override with OLLAMA_PORT).
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 IMAGE="$(grep -m1 '^    image: timberio/vector' compose.yaml | awk '{print $2}')"
-mkdir -p /tmp/kilo/vector-data
-VECTOR="docker run --rm -v $PWD/collector:/etc/vector:ro -v $PWD/tests:/opt/tests:ro -v /tmp/kilo/vector-data:/var/lib/vector-data --entrypoint vector ${IMAGE}"
+TEST_TMP="/tmp/ollama-monitoring"
+mkdir -p "${TEST_TMP}/vector-data"
+VECTOR=(docker run --rm -v "$PWD/collector:/etc/vector:ro" -v "$PWD/tests:/opt/tests:ro" -v "${TEST_TMP}/vector-data:/var/lib/vector-data" --entrypoint vector "${IMAGE}")
 PASS=0; FAIL=0
 check() { # check <name> <cmd...>
   local name="$1"; shift
@@ -26,16 +29,16 @@ check() { # check <name> <cmd...>
 }
 
 echo "=== 1. Vector config validation ==="
-if $VECTOR validate /etc/vector/vector.toml >/tmp/kilo/validate.out 2>&1; then
+if "${VECTOR[@]}" validate /etc/vector/vector.toml >"${TEST_TMP}/validate.out" 2>&1; then
   check "vector validate collector/vector.toml" true
 else
   check "vector validate collector/vector.toml" false
-  sed 's/\x1b\[[0-9;]*m//g' /tmp/kilo/validate.out | tail -20
+  sed 's/\x1b\[[0-9;]*m//g' "${TEST_TMP}/validate.out" | tail -20
 fi
 
 echo "=== 2. Parser unit tests (fixtures from real journal output) ==="
 python3 tests/gen_tests.py >/dev/null
-UNIT_OUT="$($VECTOR test /etc/vector/vector.toml /opt/tests/generated_tests.toml 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+UNIT_OUT="$("${VECTOR[@]}" test /etc/vector/vector.toml /opt/tests/generated_tests.toml 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
 UNIT_PASS="$(printf '%s' "${UNIT_OUT}" | grep -c '\.\.\. passed' || true)"
 UNIT_FAIL="$(printf '%s' "${UNIT_OUT}" | grep -c '\.\.\. failed' || true)"
 if [[ "${UNIT_FAIL}" -eq 0 ]] && [[ "${UNIT_PASS}" -gt 0 ]]; then
@@ -51,32 +54,53 @@ check "no WSL_HOST_IP machinery" bash -c "! grep -rn 'WSL_HOST_IP' compose.yaml 
 check "no proxy service or directory" bash -c "[[ ! -d proxy ]] && ! grep -q 'ollama-proxy' compose.yaml"
 check "no Docker socket mounted" bash -c "! grep -rn 'docker.sock' compose.yaml"
 check "no privileged containers" bash -c "! grep -qn 'privileged' compose.yaml"
-check "journal mounts are read-only" bash -c "grep -A4 'Host journal' compose.yaml | grep -q '/var/log/journal:/var/log/journal:ro'"
+check "journal bind is read-only and does not create host paths" bash -c "grep -q 'create_host_path: false' compose.yaml && grep -q 'read_only: true' compose.yaml"
 check "no Loki / OpenTelemetry" bash -c "! grep -rniE 'loki|otel|opentelemetry' compose.yaml prometheus/ collector/ 2>/dev/null"
 check "no prompt/response capture in collector" bash -c "! grep -rniE 'prompt_text|response_text|\.content|body' collector/vector.toml"
+check "no fixed collector uid/gid in Compose" bash -c "! grep -qE '1000|999' compose.yaml"
+check "NVIDIA is profile-gated" bash -c "grep -q 'profiles:.*nvidia' compose.yaml"
 
-LIVE=0; SECURITY=0; RESTART=0
+LIVE=0; SECURITY=0; RESTART=0; OBSERVE=0; KILO=0
 for arg in "$@"; do
   case "$arg" in
     --live) LIVE=1 ;;
     --security) SECURITY=1 ;;
     --restart) RESTART=1 ;;
+    --observe-client) OBSERVE=1 ;;
+    --kilo) OBSERVE=1; KILO=1 ;;
+    *) echo "ERROR: unknown test option: ${arg}" >&2; exit 1 ;;
   esac
 done
 
+echo; echo "=== 4. Offline portability, profile, and privacy checks ==="
+if bash tests/test_offline.sh; then
+  PASS=$((PASS+1))
+else
+  FAIL=$((FAIL+1))
+fi
+
 if [[ ${LIVE} -eq 1 ]]; then
-  echo; echo "=== 4. Live validation (real request through native Ollama) ==="
+  echo; echo "=== 5. Live validation (real request through native Ollama) ==="
   OLLAMA_PORT="${OLLAMA_PORT:-11434}" bash tests/test_live.sh || FAIL=$((FAIL+1))
 fi
 
 if [[ ${SECURITY} -eq 1 ]]; then
-  echo; echo "=== 5. Security / privacy ==="
+  echo; echo "=== 6. Security / privacy ==="
   bash tests/test_security.sh || FAIL=$((FAIL+1))
 fi
 
 if [[ ${RESTART} -eq 1 ]]; then
-  echo; echo "=== 6. Collector restart / cursor behavior ==="
+  echo; echo "=== 7. Collector restart / cursor behavior ==="
   bash tests/test_restart.sh || FAIL=$((FAIL+1))
+fi
+
+if [[ ${OBSERVE} -eq 1 ]]; then
+  echo; echo "=== 8. Passive external-client acceptance ==="
+  if [[ ${KILO} -eq 1 ]]; then
+    bash tests/test_observe_client.sh kilo || FAIL=$((FAIL+1))
+  else
+    bash tests/test_observe_client.sh generic || FAIL=$((FAIL+1))
+  fi
 fi
 
 echo

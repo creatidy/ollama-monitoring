@@ -11,7 +11,7 @@ scrape_configs:
     static_configs:
       - targets: ["journal-metrics:9598"]
 
-  # NVIDIA GPU (RTX 3090) via nvidia-smi passthrough.
+  # Optional NVIDIA GPU telemetry via nvidia-smi passthrough.
   - job_name: nvidia-gpu
     scrape_interval: 10s
     static_configs:

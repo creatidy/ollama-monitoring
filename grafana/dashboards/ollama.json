@@ -499,7 +499,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 6, "x": 0, "y": 35 },
       "targets": [
-        { "refId": "A", "expr": "nvidia_smi_utilization_gpu_ratio * 100", "legendFormat": "RTX 3090" }
+         { "refId": "A", "expr": "nvidia_smi_utilization_gpu_ratio * 100", "legendFormat": "GPU" }
       ],
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },

@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Read-only preflight diagnostics for the passive Ollama monitoring stack.
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit
+# shellcheck source=bin/common.sh
+source bin/common.sh
+
+FAIL=0
+ok()   { printf '[ OK ] %s\n' "$1"; }
+info() { printf '[INFO] %s\n' "$1"; }
+warn() { printf '[WARN] %s\n' "$1"; }
+bad()  { printf '[FAIL] %s\n' "$1"; FAIL=$((FAIL + 1)); }
+
+echo "=== ollama-monitoring doctor (read-only) ==="
+echo
+echo "=== Host ==="
+if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+  if is_wsl2; then
+    ok "Linux / WSL2 detected"
+  else
+    info "Linux detected (not WSL2; standard systemd Linux is expected to work)"
+  fi
+else
+  bad "Linux is required by the journald collector"
+fi
+
+if has_systemd; then
+  SYSTEMD_STATE="$(systemctl is-system-running 2>/dev/null || true)"
+  if [[ "${SYSTEMD_STATE}" == "running" || "${SYSTEMD_STATE}" == "degraded" ]]; then
+    ok "systemd available (${SYSTEMD_STATE})"
+  else
+    warn "systemd tools are installed but the manager state is ${SYSTEMD_STATE:-unknown}"
+  fi
+else
+  bad "systemd and journalctl are unavailable"
+fi
+
+DOCKER_OK=0
+if command -v docker >/dev/null 2>&1; then
+  if docker info >/dev/null 2>&1; then
+    DOCKER_VERSION="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+    ok "Docker${DOCKER_VERSION:+ ${DOCKER_VERSION}}"
+    DOCKER_OK=1
+  else
+    bad "Docker is installed but the daemon is not reachable"
+  fi
+else
+  bad "Docker is not installed"
+fi
+
+if [[ "${DOCKER_OK}" -eq 1 ]] && docker compose version >/dev/null 2>&1; then
+  COMPOSE_VERSION="$(docker compose version 2>/dev/null || true)"
+  ok "Docker Compose${COMPOSE_VERSION:+ (${COMPOSE_VERSION})}"
+else
+  bad "Docker Compose is unavailable"
+fi
+
+echo
+echo "=== Native Ollama ==="
+OLLAMA_VERSION="$(ollama_version || true)"
+if [[ -n "${OLLAMA_VERSION}" ]]; then
+  ok "Ollama ${OLLAMA_VERSION} on :${OLLAMA_PORT}"
+else
+  bad "native Ollama is not reachable on :${OLLAMA_PORT}"
+fi
+
+if has_systemd; then
+  if systemctl list-unit-files ollama.service --no-legend 2>/dev/null | grep -q '^ollama\.service'; then
+    OLLAMA_STATE="$(systemctl is-active ollama.service 2>/dev/null || true)"
+    if [[ "${OLLAMA_STATE}" == "active" ]]; then
+      ok "ollama.service exists and is active"
+    else
+      warn "ollama.service exists but is ${OLLAMA_STATE:-inactive}"
+    fi
+  else
+    warn "ollama.service was not found; the collector expects a native systemd unit"
+  fi
+fi
+
+echo
+echo "=== Journal and collector access ==="
+if command -v journalctl >/dev/null 2>&1; then
+  ok "journalctl available"
+else
+  bad "journalctl is unavailable"
+fi
+
+JOURNAL_DIR_FOUND=0
+if resolve_runtime_values 1; then
+  JOURNAL_DIR_FOUND=1
+  ok "journal source: ${JOURNAL_DIR}"
+  ok "collector identity: ${COLLECTOR_UID}:${COLLECTOR_GID}"
+  if [[ -n "$(getent group systemd-journal 2>/dev/null || true)" ]]; then
+    ok "systemd-journal gid: $(getent group systemd-journal | awk -F: 'NR == 1 { print $3 }')"
+  else
+    info "systemd-journal group name is unavailable; using journal file gid ${JOURNAL_GID}"
+  fi
+  ok "effective journal-file gid: ${JOURNAL_GID}"
+
+  JOURNAL_FILE="$(journal_file "${JOURNAL_DIR}" 2>/dev/null || true)"
+  if [[ -n "${JOURNAL_FILE}" ]]; then
+    JOURNAL_MODE="$(stat -c '%A %a' "${JOURNAL_FILE}" 2>/dev/null || true)"
+    info "journal file permissions: ${JOURNAL_MODE:-unavailable}"
+  else
+    warn "journal source has no journal file yet"
+  fi
+
+  if journalctl -u ollama.service -n 1 --no-pager >/dev/null 2>&1; then
+    ok "current user can read ollama.service journal"
+  else
+    warn "current user cannot read ollama.service journal; container group probe is required"
+  fi
+
+  if [[ "${DOCKER_OK}" -eq 1 ]]; then
+    if collector_journal_probe; then
+      ok "collector uid/gid can read the journal through the Vector image"
+    else
+      PROBE_STATUS=$?
+      if [[ "${PROBE_STATUS}" -eq 2 ]]; then
+        info "Vector image is not local; run ./bin/up to perform the container permission probe"
+      else
+        warn "collector permission probe failed; inspect journal file group/mode"
+      fi
+    fi
+  fi
+else
+  bad "no usable existing journal source found (/var/log/journal or /run/log/journal)"
+  info "Set JOURNAL_DIR to an existing journal directory if the host uses a different path"
+fi
+
+if [[ -d data/vector && -w data/vector ]]; then
+  ok "data/vector is writable for the collector cursor"
+elif [[ ! -e data/vector && -w data ]]; then
+  ok "data directory is writable; ./bin/up can create the collector cursor directory"
+else
+  warn "data/vector is not writable; ./bin/up cannot persist the journal cursor"
+fi
+
+if [[ "${JOURNAL_DIR_FOUND}" -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
+  if journalctl -u ollama.service -b -n 500 --no-pager -o cat 2>/dev/null |
+    python3 -c 'import re, sys; sys.exit(0 if re.search(r"prompt processing, n_tokens|n_gen =|n_decoded =|prompt eval time =|eval time =", sys.stdin.read()) else 1)'; then
+    ok "parser-compatible llama.cpp timing lines detected in the current boot"
+  else
+    warn "no recognizable llama.cpp timing lines found in the current boot"
+  fi
+fi
+
+echo
+echo "=== NVIDIA (optional) ==="
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  GPU_NAMES="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd ', ' -)"
+  ok "NVIDIA available${GPU_NAMES:+ (${GPU_NAMES})}"
+  if [[ "${DOCKER_OK}" -eq 1 ]]; then
+    if docker_gpu_accessible never; then
+      ok "Docker GPU passthrough works"
+    else
+      warn "host NVIDIA is available but Docker GPU passthrough failed; core metrics still work"
+    fi
+  fi
+else
+  info "NVIDIA not detected; core journal metrics do not require a GPU"
+fi
+
+echo
+echo "=== Loaded Ollama models ==="
+MODEL_COUNT="$(ollama_model_count || true)"
+if [[ "${MODEL_COUNT}" =~ ^[0-9]+$ ]]; then
+  if [[ "${MODEL_COUNT}" -gt 1 ]]; then
+    warn "${MODEL_COUNT} Ollama models loaded; journal timing metrics are not model-labelled and may be aggregated"
+  elif [[ "${MODEL_COUNT}" -eq 1 ]]; then
+    ok "1 Ollama model runner loaded"
+  else
+    info "0 Ollama model runners loaded"
+  fi
+else
+  warn "could not query Ollama /api/ps"
+fi
+
+echo
+if [[ "${FAIL}" -eq 0 ]]; then
+  echo "Doctor: no blocking problems detected."
+else
+  echo "Doctor: ${FAIL} blocking problem(s) detected. Fix them before ./bin/up."
+fi
+exit "${FAIL}"

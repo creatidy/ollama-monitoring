@@ -5,7 +5,7 @@
 #  - journal and config mounts are read-only
 #  - no Docker socket, no privileged mode, no host PID namespace
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { echo "  [ OK ] $1"; PASS=$((PASS+1)); }
@@ -20,12 +20,16 @@ MODEL="${MODEL:-${OLLAMA_MODEL:-}}"
 if [[ -z "${MODEL}" ]]; then
   MODEL="$(curl -sf -m 5 "http://127.0.0.1:${PORT}/api/ps" | python3 -c '
 import json,sys
-print(n[0] if n else "")' 2>/dev/null)"
+d = json.load(sys.stdin)
+names = [m.get("name", "") for m in d.get("models", []) if "embed" not in m.get("name", "").lower()]
+print(names[0] if names else "")' 2>/dev/null)"
 fi
 if [[ -z "${MODEL}" ]]; then
   MODEL="$(curl -sf -m 5 "http://127.0.0.1:${PORT}/api/tags" | python3 -c '
 import json,sys
-print(n[0] if n else "")' 2>/dev/null)"
+d = json.load(sys.stdin)
+names = [m.get("name", "") for m in d.get("models", []) if "embed" not in m.get("name", "").lower()]
+print(names[0] if names else "")' 2>/dev/null)"
 fi
 if [[ -n "${MODEL}" ]]; then
   curl -sf -m 120 "http://127.0.0.1:${PORT}/api/generate" -H 'Content-Type: application/json' \
@@ -49,7 +53,6 @@ else
 fi
 
 echo "=== Security: container isolation ==="
-INSPECT="$(docker compose -f compose.yaml config --format json 2>/dev/null || docker compose config 2>/dev/null)"
 CHECKS="$(docker inspect ollama-journal-metrics --format '{{json .HostConfig}} {{json .Mounts}}' 2>/dev/null)"
 if printf '%s' "${CHECKS}" | grep -q '"Privileged":false'; then
   ok "collector not privileged"

@@ -1,7 +1,7 @@
 name: ollama-monitoring
 
 services:
-  # Passive collector: reads the WSL host systemd journal for ollama.service
+  # Passive collector: reads the host systemd journal for ollama.service
   # and exports llama.cpp timing telemetry to Prometheus. Sits outside the
   # inference path; clients talk to native Ollama directly.
   journal-metrics:
@@ -9,23 +9,29 @@ services:
     container_name: ollama-journal-metrics
     restart: unless-stopped
     command: ["--config", "/etc/vector/vector.toml"]
-    # Run as non-root (uid 1000) but with the host systemd-journal group
-    # (gid 999 on this host: `getent group systemd-journal`) so journal files
-    # (root:systemd-journal, mode 0640) are readable without any privilege.
-    user: "1000:1000"
+    # bin/up detects these host values. Explicit values are useful for unusual
+    # installations and for offline `docker compose config` validation.
+    user: "${COLLECTOR_UID:?Run ./bin/up or set COLLECTOR_UID}:${COLLECTOR_GID:?Run ./bin/up or set COLLECTOR_GID}"
     group_add:
-      - "999"
+      - "${JOURNAL_GID:?Run ./bin/up or set JOURNAL_GID}"
     volumes:
       # Mount the whole directory: single-file bind mounts go stale when the
       # file's inode is replaced (Docker Desktop / WSL2).
       - ./collector:/etc/vector:ro
-      # Host journal, read-only. This WSL instance keeps a persistent journal
-      # in /var/log/journal; /run/log/journal is mounted for setups that only
-      # have the volatile one. /etc/machine-id tells journalctl which files
-      # belong to this host.
-      - /var/log/journal:/var/log/journal:ro
-      - /run/log/journal:/run/log/journal:ro
-      - /etc/machine-id:/etc/machine-id:ro
+      # bin/up resolves one existing persistent or volatile source. The long
+      # bind form prevents Docker from creating a missing host directory.
+      - type: bind
+        source: "${JOURNAL_DIR:?Run ./bin/up or set JOURNAL_DIR}"
+        target: /var/log/journal
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /etc/machine-id
+        target: /etc/machine-id
+        read_only: true
+        bind:
+          create_host_path: false
       # Persistent journald cursor: after a collector restart, reading resumes
       # where it stopped instead of replaying the boot into the counters.
       - ./data/vector:/var/lib/vector-data
@@ -39,6 +45,7 @@ services:
       start_period: 20s
 
   nvidia-gpu-exporter:
+    profiles: ["nvidia"]
     image: utkuozdemir/nvidia_gpu_exporter:1.15.0
     container_name: ollama-nvidia-exporter
     restart: unless-stopped
@@ -85,7 +92,7 @@ services:
         condition: service_healthy
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-ollama}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Run ./bin/up to create .env or set GRAFANA_ADMIN_PASSWORD}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ollama.json
     volumes:

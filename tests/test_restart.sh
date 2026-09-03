@@ -6,7 +6,7 @@
 #  - new journal entries keep flowing after restart
 #  - Prometheus resumes scraping the collector
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { echo "  [ OK ] $1"; PASS=$((PASS+1)); }

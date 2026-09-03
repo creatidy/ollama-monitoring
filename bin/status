@@ -2,7 +2,10 @@
 # Overview of the monitoring stack: container health, endpoints, native
 # Ollama reachability, Prometheus scrape targets, journal collector liveness.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
+# shellcheck source=bin/common.sh
+source bin/common.sh
+resolve_runtime_values 0 || true
 
 fail=0
 ok()   { printf '  [ OK ] %s\n' "$1"; }
@@ -14,10 +17,19 @@ docker compose ps --format 'table {{.Name}}\t{{.Service}}\t{{.Status}}\t{{.Healt
 
 echo
 echo "=== Native Ollama (direct, not part of this stack) ==="
-if curl -sf -m 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
-  ok "native Ollama on :11434 ($(curl -sf -m 3 http://127.0.0.1:11434/api/version))"
+if curl -sf -m 3 "http://127.0.0.1:${OLLAMA_PORT}/api/version" >/dev/null 2>&1; then
+  VERSION="$(ollama_version)"
+  ok "native Ollama on :${OLLAMA_PORT} (version ${VERSION:-unknown})"
+  MODEL_COUNT="$(ollama_model_count)"
+  if [[ -n "${MODEL_COUNT}" && "${MODEL_COUNT}" -gt 1 ]]; then
+    warn "Multiple loaded models detected. Journal timing metrics are not model-labelled and may be aggregated."
+  elif [[ "${MODEL_COUNT}" == "1" ]]; then
+    ok "one Ollama model runner loaded (journal attribution is unambiguous in practice)"
+  elif [[ "${MODEL_COUNT}" == "0" ]]; then
+    warn "no Ollama model runner currently loaded"
+  fi
 else
-  warn "native Ollama not reachable on :11434 (monitoring still works; clients need it)"
+  warn "native Ollama not reachable on :${OLLAMA_PORT} (monitoring still works; clients need it)"
 fi
 
 echo
@@ -70,23 +82,39 @@ TARGETS="$(curl -sf -m 5 'http://127.0.0.1:9090/api/v1/targets?state=active' 2>/
 if [[ -z "${TARGETS}" ]]; then
   bad "cannot reach Prometheus API"
 else
-  echo "${TARGETS}" | python3 -c '
+  TARGETS_RENDERED="$(echo "${TARGETS}" | python3 -c '
 import json,sys
 d = json.load(sys.stdin)
 for t in d["data"]["activeTargets"]:
     status = t["health"]
-    label = f"{t['"'"'labels'"'"'].get('"'"'job'"'"','"'"'?'"'"')} ({t['"'"'scrapeUrl'"'"']})"
+    job = t["labels"].get("job", "?")
+    label = f"{job} ({t['"'"'scrapeUrl'"'"']})"
     err = t.get("lastError","")
+    if status == "up":
+        marker = " OK "
+    elif job == "nvidia-gpu":
+        marker = "WARN"
+        err = (err + "; " if err else "") + "optional; enable with OLLAMA_MONITORING_GPU=nvidia"
+    else:
+        marker = "FAIL"
     line = f"{status.upper():8s} {label}"
     if err: line += f"  lastError={err}"
-    print("  [" + (" OK " if status=="up" else "FAIL") + "] " + line)
-' || bad "could not parse targets"
+    print(f"  [{marker}] {line}")
+')"
+  if [[ -n "${TARGETS_RENDERED}" ]]; then
+    printf '%s\n' "${TARGETS_RENDERED}"
+    if printf '%s\n' "${TARGETS_RENDERED}" | grep -q '\[FAIL\]'; then
+      fail=1
+    fi
+  else
+    bad "could not parse targets"
+  fi
 fi
 
 echo
 if [[ ${fail} -eq 0 ]]; then
   echo "Status: all good."
 else
-  echo "Status: problems detected (see above). Run ./bin/up to heal."
+  echo "Status: problems detected (see above). Run ./bin/doctor, then ./bin/up to heal."
 fi
 exit ${fail}
